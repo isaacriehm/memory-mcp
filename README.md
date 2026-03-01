@@ -278,6 +278,12 @@ Copy `.env.example` to `.env` and fill in your values.
 | `PG_POOL_MAX` | `10` | asyncpg maximum pool connections |
 | `STAGING_RETENTION_DAYS` | `7` | Days to retain completed/failed staging jobs |
 
+### Optional — Authentication
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_KEY` | _(unset)_ | Static Bearer token for the production server. Unset = no auth (trusted network). See [External Provider Auth](#external-provider-auth). |
+
 ### Optional — Server
 
 | Variable | Default | Description |
@@ -309,6 +315,56 @@ Copy `.env.example` to `.env` and fill in your values.
 | `GITHUB_PAT` | GitHub Personal Access Token with `repo` scope |
 | `GITHUB_BACKUP_REPO` | Target repo in `owner/repo` format |
 | `BACKUP_INTERVAL_SECONDS` | Seconds between backups (default: `21600` = 6 hours) |
+
+---
+
+## External Provider Auth
+
+By default the production server runs without authentication — suitable when access is restricted to a trusted network (WireGuard, Tailscale, etc.).
+
+To allow external AI providers (ChatGPT Actions, any public-internet client) to connect securely, set `API_KEY` in your `.env`:
+
+```bash
+# Generate a secure random token
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+```env
+API_KEY=your-generated-token
+```
+
+Every request to the production server will then require `Authorization: Bearer <token>`. The admin server (`:8767`) is never exposed publicly and has no auth requirement.
+
+**MCP client config (external, with auth):**
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "type": "http",
+      "url": "https://your-public-url/mcp",
+      "headers": {
+        "Authorization": "Bearer your-generated-token"
+      }
+    }
+  }
+}
+```
+
+**WireGuard / trusted network (no auth):**
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "type": "http",
+      "url": "http://10.x.x.x:8766/mcp"
+    }
+  }
+}
+```
+
+The same server handles both — `API_KEY` is the only switch.
 
 ---
 

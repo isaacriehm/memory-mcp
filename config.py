@@ -42,6 +42,8 @@ PRODUCTION_PORT = int(os.getenv("PRODUCTION_PORT", "8766"))
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", "8767"))
 STAGING_RETENTION_DAYS = int(os.getenv("STAGING_RETENTION_DAYS", "7"))
 
+API_KEY = os.getenv("API_KEY")  # Optional; enables Bearer token auth when set
+
 MAX_MEMORIZE_TEXT_LENGTH = int(os.getenv("MAX_MEMORIZE_TEXT_LENGTH", "500000"))
 
 # Context Store

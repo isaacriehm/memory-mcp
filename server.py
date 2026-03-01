@@ -2,7 +2,7 @@ import asyncio
 import traceback
 import asyncpg
 
-from config import logger, DATABASE_URL, PG_POOL_MIN, PG_POOL_MAX, STAGING_RETENTION_DAYS, PRODUCTION_PORT, ADMIN_PORT
+from config import logger, DATABASE_URL, PG_POOL_MIN, PG_POOL_MAX, STAGING_RETENTION_DAYS, PRODUCTION_PORT, ADMIN_PORT, API_KEY
 from utils import _now
 import db
 from db import init_db
@@ -11,6 +11,8 @@ from tools.admin import mcp as admin_mcp
 from tools.context import synthesize_system_primer
 
 from contextlib import asynccontextmanager
+from starlette.middleware import Middleware
+from auth import BearerTokenMiddleware
 
 
 async def _ingestion_worker() -> None:
@@ -203,11 +205,18 @@ if __name__ == "__main__":
         production_mcp._lifespan = server_lifespan
         admin_mcp._lifespan = dummy_lifespan
         
+        prod_middleware = None
+        if API_KEY:
+            prod_middleware = [Middleware(BearerTokenMiddleware, api_key=API_KEY)]
+            logger.info("Bearer token auth enabled on production server.")
+        else:
+            logger.info("No API_KEY set — production server running without auth (WireGuard-trusted mode).")
+
         logger.info(f"Production server listening on 0.0.0.0:{PRODUCTION_PORT}")
         logger.info(f"Admin server listening on 0.0.0.0:{ADMIN_PORT}")
-        
+
         await asyncio.gather(
-            production_mcp.run_http_async(host="0.0.0.0", port=PRODUCTION_PORT),
+            production_mcp.run_http_async(host="0.0.0.0", port=PRODUCTION_PORT, middleware=prod_middleware),
             admin_mcp.run_http_async(host="0.0.0.0", port=ADMIN_PORT),
         )
 
