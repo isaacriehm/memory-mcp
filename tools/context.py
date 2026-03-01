@@ -22,7 +22,8 @@ async def initialize_context(ctx: Context) -> dict[str, Any]:
     Returns the System Primer: user identity, full taxonomy map, and retrieval guide.
     Must be called exactly once per session to orient the agent before interacting with the knowledge base.
     If `verification_block` is non-empty, inject it into the System Primer under ## Verification Required.
-    Query the user regarding the accuracy of those specific records BEFORE executing any other commands."""
+    Query the user regarding the accuracy of those specific records BEFORE executing any other commands.
+    If `pending_handoffs` is non-empty, surface them to the user — another AI session left work to be picked up."""
     logger.info("Tool invoked: initialize_context")
     try:
         db_pool = get_pool()
@@ -50,6 +51,15 @@ async def initialize_context(ctx: Context) -> dict[str, Any]:
                 """
             )
 
+            handoff_rows = await conn.fetch(
+                """
+                SELECT key, value, created_at, updated_at, expires_at
+                FROM context_store
+                WHERE scope = 'handoff' AND expires_at > NOW()
+                ORDER BY updated_at DESC
+                """
+            )
+
         results = []
         for r in rows:
             item = {
@@ -71,6 +81,18 @@ async def initialize_context(ctx: Context) -> dict[str, Any]:
             for r in expired_rows
         ]
 
+        pending_handoffs = [
+            {
+                "key": r["key"],
+                "preview": r["value"][:200] + ("..." if len(r["value"]) > 200 else ""),
+                "created_at": r["created_at"].isoformat(),
+                "updated_at": r["updated_at"].isoformat(),
+                "expires_at": r["expires_at"].isoformat(),
+                "resume_prompt": f"Execute pending handoff: {r['key'].removeprefix('handoff.')}",
+            }
+            for r in handoff_rows
+        ]
+
         verification_block = ""
         if verification_required:
             lines = ["## Verification Required", ""]
@@ -89,14 +111,15 @@ async def initialize_context(ctx: Context) -> dict[str, Any]:
             verification_block = "\n".join(lines)
 
         logger.info(
-            "initialize_context retrieved %d system records, %d requiring verification.",
-            len(results), len(verification_required),
+            "initialize_context retrieved %d system records, %d requiring verification, %d pending handoffs.",
+            len(results), len(verification_required), len(pending_handoffs),
         )
         return {
             "ok": True,
             "results": results,
             "verification_required": verification_required,
             "verification_block": verification_block,
+            "pending_handoffs": pending_handoffs,
         }
     except Exception as e:
         logger.error("Error in initialize_context: %s\n%s", e, traceback.format_exc())
@@ -262,6 +285,23 @@ async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
             f"- Use context store for: active plans, current task state, session summaries, anything that will be stale in < 7 days\n"
             f"- Use memorize_context for: facts about you, project decisions, architecture notes, anything that should persist long-term\n"
             f"- Default TTL: 24 hours. Plans/tasks: 72 hours. Never exceed 168 hours (1 week) for working context.\n\n"
+            f"## Handoff Protocol\n"
+            f"Use the context store to pass plans and task state between AI sessions or between different AI tools.\n\n"
+            f"**Exporting a handoff (AI A — the planner):**\n"
+            f"When the user says 'export plan', 'hand this off', or similar:\n"
+            f"1. Write the plan to context store: `set_context('handoff.<label>', <plan text>, ttl_hours=72, scope='handoff')`\n"
+            f"   - `<label>` is a short slug describing the work, e.g. `handoff.auth-refactor`\n"
+            f"   - Include enough context for a fresh AI to execute without clarification: goal, steps, relevant files, decisions made\n"
+            f"2. Tell the user the resume prompt to paste into the other AI:\n"
+            f"   > **Resume prompt:** \"Execute pending handoff: <label>\"\n\n"
+            f"**Importing a handoff (AI B — the executor):**\n"
+            f"When the user says 'execute pending handoff', 'resume handoff: <label>', or similar:\n"
+            f"1. If a label is given: `get_context('handoff.<label>')` and execute the plan\n"
+            f"2. If no label: check `initialize_context` response for `pending_handoffs` — it lists all active handoffs\n"
+            f"   then `get_context` the relevant one and confirm with the user before starting\n"
+            f"3. After completion: `delete_context('handoff.<label>')` to clean up\n\n"
+            f"**Note:** `initialize_context` automatically surfaces any active handoffs in `pending_handoffs` "
+            f"so you never need to poll manually at session start.\n\n"
             f"## Retrieval Guide\n"
             f"- `search_memory(query)` — hybrid semantic + keyword search, returns top 10\n"
             f"- `search_memory(query, category_path='projects.myapp.planning')` — scoped to subtree\n"
