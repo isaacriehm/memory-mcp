@@ -10,6 +10,7 @@ from .admin_tools import (
     run_diagnostics,
     get_ingestion_stats,
     flush_staging,
+    contradiction_audit,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "run_diagnostics",
     "get_ingestion_stats",
     "flush_staging",
+    "contradiction_audit",
 ]

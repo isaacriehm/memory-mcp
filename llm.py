@@ -17,9 +17,11 @@ def _parse_json_safe(raw: str) -> dict:
     return json.loads(cleaned or "{}")
 
 
-class ConflictResolutionResult(TypedDict):
+class ConflictResolutionResult(TypedDict, total=False):
     resolution: str
     updated_text: str
+    reason_summary: str
+    changed_claims: list[str]
 
 
 async def embed(text: str) -> list[float]:
@@ -190,7 +192,9 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
                         "remains fully true and uncontradicted in the context of NEW TEXT. "
                         "A single mutated fact — however minor — forces \"supersedes\". "
                         "When supersedes, updated_text must be the full original paragraph with the fact integrated, not the isolated fragment.\n\n"
-                        "Output JSON with keys 'resolution' and 'updated_text'."
+                        "Output JSON with keys 'resolution' and 'updated_text'. "
+                        "Also include optional keys 'reason_summary' (one short sentence) and "
+                        "'changed_claims' (array of short strings) when possible."
                     ),
                 },
                 {"role": "user", "content": f"<old_text>{safe_old}</old_text>\n\n<new_text>{safe_new}</new_text>"},
@@ -204,6 +208,11 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
                         "properties": {
                             "resolution": {"type": "string", "enum": ["supersedes", "merges"]},
                             "updated_text": {"type": "string"},
+                            "reason_summary": {"type": "string"},
+                            "changed_claims": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
                         },
                         "required": ["resolution", "updated_text"],
                         "additionalProperties": False,
@@ -220,9 +229,20 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
         raw = await _with_retries(_call, label=f"evaluate_conflict({CONFLICT_MODEL})")
         parsed = _parse_json_safe(raw or "{}")
         resolution = parsed.get("resolution", "supersedes")
+        if resolution not in ("supersedes", "merges"):
+            resolution = "supersedes"
         updated_text = parsed.get("updated_text", new_text)
+        reason_summary = parsed.get("reason_summary")
+        changed_claims = parsed.get("changed_claims")
+        result: ConflictResolutionResult = {"resolution": resolution, "updated_text": updated_text}
+        if isinstance(reason_summary, str) and reason_summary.strip():
+            result["reason_summary"] = reason_summary.strip()
+        if isinstance(changed_claims, list):
+            claims = [str(c).strip() for c in changed_claims if str(c).strip()]
+            if claims:
+                result["changed_claims"] = claims
         logger.debug("Conflict resolved as '%s' with text length %d", resolution, len(updated_text))
-        return {"resolution": resolution, "updated_text": updated_text}
+        return result
 
     except Exception as e:
         logger.error("Conflict evaluation failed: %s\n%s", e, traceback.format_exc())

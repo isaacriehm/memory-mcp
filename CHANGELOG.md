@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-03-03
+
+### Added
+- Persisted `conflict_audit_events` table for ingestion-time contradiction decisions (`supersedes`/`merges`) with similarity, taxonomy path, and compact JSON details.
+- New read-only MCP tool `contradiction_audit` (available on production and admin servers) for querying contradiction history with limit, category, resolution, and time filters.
+- Conflict evaluation contract now supports optional `reason_summary` and `changed_claims` fields for transparent audit payloads.
+
 ## [1.0.0] - 2026-02-27
 
 ### Added

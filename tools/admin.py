@@ -3,7 +3,7 @@ from .ingestion import memorize_context, check_ingestion_status
 from .search import search_memory, list_categories, explore_taxonomy, fetch_document
 from .context import initialize_context, trace_history, confirm_memory_validity
 from .crud import update_memory, delete_memory, recategorize_memory, bulk_move_category, update_memory_metadata
-from .admin_tools import prune_history, export_memories, run_diagnostics, get_ingestion_stats, flush_staging
+from .admin_tools import prune_history, export_memories, run_diagnostics, get_ingestion_stats, flush_staging, contradiction_audit
 from tools_context import register_context_tools
 
 mcp = FastMCP("memory-mcp-admin")
@@ -18,6 +18,7 @@ mcp.tool()(fetch_document)
 mcp.tool()(trace_history)
 mcp.tool()(confirm_memory_validity)
 mcp.tool()(update_memory)
+mcp.tool()(contradiction_audit)
 
 # Admin only
 mcp.tool()(delete_memory)

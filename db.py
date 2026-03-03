@@ -109,6 +109,24 @@ async def init_db(conn: asyncpg.Connection) -> None:
         """
     )
 
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conflict_audit_events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            new_memory_id UUID REFERENCES memories(id) ON DELETE SET NULL,
+            old_memory_id UUID REFERENCES memories(id) ON DELETE SET NULL,
+            resolution VARCHAR(20) NOT NULL CHECK (resolution IN ('supersedes', 'merges')),
+            similarity DOUBLE PRECISION,
+            category_path ltree,
+            details JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+        """
+    )
+
+    # Safety migration for partially-created schemas.
+    await conn.execute("ALTER TABLE conflict_audit_events ADD COLUMN IF NOT EXISTS details JSONB NOT NULL DEFAULT '{}'::jsonb;")
+
     logger.debug("Establishing GIST & HNSW Indexes...")
     await conn.execute("CREATE INDEX IF NOT EXISTS memories_category_path_gist ON memories USING gist (category_path);")
     await conn.execute("CREATE INDEX IF NOT EXISTS memories_lexical_search_gin ON memories USING GIN (lexical_search);")
@@ -122,6 +140,18 @@ async def init_db(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS memories_verify_after_idx "
         "ON memories (verify_after) WHERE verify_after IS NOT NULL;"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS conflict_audit_events_created_at_idx "
+        "ON conflict_audit_events (created_at DESC);"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS conflict_audit_events_resolution_idx "
+        "ON conflict_audit_events (resolution);"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS conflict_audit_events_category_path_gist "
+        "ON conflict_audit_events USING gist (category_path);"
     )
 
     await conn.execute(
@@ -269,11 +299,24 @@ async def process_and_insert_memory(
                 resolution_result = await evaluate_conflict(similar_mem["content"], chunk_content)
                 final_text = resolution_result["updated_text"]
                 final_vec = await embed(final_text)
+            resolution = resolution_result.get("resolution", "supersedes")
+            if resolution not in ("supersedes", "merges"):
+                resolution = "supersedes"
 
             chunk_metadata = dict(base_metadata)
             if chunk_tags:
                 chunk_metadata["tags"] = chunk_tags
             chunk_metadata["volatility_class"] = chunk_volatility
+
+            audit_details: dict[str, Any] = {}
+            reason_summary = resolution_result.get("reason_summary")
+            if isinstance(reason_summary, str) and reason_summary.strip():
+                audit_details["reason_summary"] = reason_summary.strip()[:400]
+            changed_claims = resolution_result.get("changed_claims")
+            if isinstance(changed_claims, list):
+                claims = [str(c).strip()[:200] for c in changed_claims if str(c).strip()]
+                if claims:
+                    audit_details["changed_claims"] = claims[:8]
 
             # Content-based ID for inserted content (isolated new state for supersedes, unified for merges).
             insert_id = generate_deterministic_id(final_text)
@@ -282,7 +325,9 @@ async def process_and_insert_memory(
                 "cat_path": chunk_path, "metadata": chunk_metadata,
                 "exists": False,
                 "supersedes": similar_mem["id"],
-                "resolution": resolution_result["resolution"],
+                "resolution": resolution,
+                "similarity": similarity,
+                "audit_details": audit_details,
                 "verify_after": chunk_verify_after,
             }
         else:
@@ -358,6 +403,21 @@ async def process_and_insert_memory(
                         await conn.execute(
                             "DELETE FROM memory_edges WHERE source_id = $1 OR target_id = $1",
                             old_id
+                        )
+
+                    if item.get("resolution") in ("supersedes", "merges"):
+                        await conn.execute(
+                            """
+                            INSERT INTO conflict_audit_events
+                            (new_memory_id, old_memory_id, resolution, similarity, category_path, details)
+                            VALUES ($1, $2, $3, $4, $5::ltree, $6::jsonb)
+                            """,
+                            insert_id,
+                            item.get("supersedes"),
+                            item["resolution"],
+                            item.get("similarity"),
+                            item["cat_path"],
+                            json.dumps(item.get("audit_details", {})),
                         )
 
                     await conn.execute(

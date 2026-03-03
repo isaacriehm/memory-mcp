@@ -309,6 +309,7 @@ async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
             f"- `list_categories()` — all paths with counts\n"
             f"- `fetch_document(memory_id)` — reconstruct full document from chunk chain\n"
             f"- `trace_history(memory_id)` — inspect supersession chain for a fact\n"
+            f"- `contradiction_audit(...)` — inspect conflict-resolution audit events and reason payloads\n"
             f"- `explore_taxonomy(path)` — expand a collapsed '[+N more]' branch\n"
             f"- `check_ingestion_status(job_id)` — poll async ingestion progress\n"
             f"- `confirm_memory_validity(memory_id)` — confirm an expired record is still accurate; advances verify_after\n"
