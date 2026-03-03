@@ -9,7 +9,7 @@ from uuid import UUID
 from fastmcp import Context
 
 from config import logger
-from utils import _now, _vector_literal, _add_ttl_warning, generate_deterministic_id
+from utils import _now, _vector_literal, _add_ttl_warning, generate_deterministic_id, sanitize_ltree_path
 from llm import embed
 from db import get_pool, _compute_verify_after
 import db
@@ -230,6 +230,271 @@ async def confirm_memory_validity(ctx: Context, memory_id: str) -> dict[str, Any
         return {"ok": False, "error": str(e)}
 
 
+def _timeline_excerpt(text: Optional[str], max_len: int = 140) -> Optional[str]:
+    if not text:
+        return None
+    compact = " ".join(text.split())
+    if not compact:
+        return None
+
+    split_idx = len(compact)
+    for token in (". ", "! ", "? "):
+        pos = compact.find(token)
+        if pos != -1:
+            split_idx = min(split_idx, pos + 1)
+    sentence = compact[:split_idx] if split_idx < len(compact) else compact
+
+    if len(sentence) <= max_len:
+        return sentence
+    return sentence[: max_len - 3] + "..."
+
+
+async def decision_timeline(
+    ctx: Context,
+    category_path: Optional[str] = None,
+    since_days: int = 90,
+    limit: int = 50,
+    include_superseded: bool = True,
+) -> dict[str, Any]:
+    """
+    Return a deterministic timeline of memory decision events.
+
+    Events are merged from memories (create/update/supersede) and, when present,
+    conflict_audit_events. Output is ordered oldest → newest.
+    """
+    logger.info(
+        "Tool invoked: decision_timeline (category_path=%s, since_days=%s, limit=%s, include_superseded=%s)",
+        category_path, since_days, limit, include_superseded,
+    )
+
+    try:
+        safe_limit = max(1, min(int(limit if limit is not None else 50), 200))
+    except Exception:
+        return {"ok": False, "error": "limit must be an integer"}
+
+    try:
+        safe_since_days = max(1, min(int(since_days if since_days is not None else 90), 3650))
+    except Exception:
+        return {"ok": False, "error": "since_days must be an integer"}
+
+    safe_category_path = None
+    if category_path and str(category_path).strip():
+        safe_category_path = sanitize_ltree_path(str(category_path).strip())
+
+    events: list[dict[str, Any]] = []
+
+    try:
+        db_pool = get_pool()
+        async with db_pool.acquire() as conn:
+            audit_table_exists = bool(
+                await conn.fetchval("SELECT to_regclass('public.conflict_audit_events') IS NOT NULL")
+            )
+
+            created_params: list[Any] = [safe_since_days]
+            created_where = [
+                "m.archived_at IS NULL",
+                "m.created_at >= NOW() - ($1::int * INTERVAL '1 day')",
+            ]
+            if safe_category_path:
+                created_params.append(safe_category_path)
+                created_where.append(f"m.category_path <@ ${len(created_params)}::ltree")
+            if not include_superseded:
+                created_where.append("m.supersedes_id IS NULL")
+            created_params.append(safe_limit)
+            created_rows = await conn.fetch(
+                f"""
+                SELECT
+                    m.id,
+                    m.content,
+                    m.category_path::text AS category_path,
+                    m.supersedes_id,
+                    m.created_at
+                FROM memories m
+                WHERE {' AND '.join(created_where)}
+                ORDER BY m.created_at DESC
+                LIMIT ${len(created_params)}
+                """,
+                *created_params,
+            )
+
+            updated_params: list[Any] = [safe_since_days]
+            updated_where = [
+                "m.archived_at IS NULL",
+                "m.supersedes_id IS NULL",
+                "m.updated_at > m.created_at",
+                "m.updated_at >= NOW() - ($1::int * INTERVAL '1 day')",
+            ]
+            if safe_category_path:
+                updated_params.append(safe_category_path)
+                updated_where.append(f"m.category_path <@ ${len(updated_params)}::ltree")
+            updated_params.append(safe_limit)
+            updated_rows = await conn.fetch(
+                f"""
+                SELECT
+                    m.id,
+                    m.content,
+                    m.category_path::text AS category_path,
+                    m.updated_at
+                FROM memories m
+                WHERE {' AND '.join(updated_where)}
+                ORDER BY m.updated_at DESC
+                LIMIT ${len(updated_params)}
+                """,
+                *updated_params,
+            )
+
+            superseded_rows = []
+            if include_superseded:
+                superseded_params: list[Any] = [safe_since_days]
+                superseded_where = [
+                    "m.archived_at IS NULL",
+                    "m.supersedes_id IS NOT NULL",
+                    "m.updated_at >= NOW() - ($1::int * INTERVAL '1 day')",
+                ]
+                if safe_category_path:
+                    superseded_params.append(safe_category_path)
+                    superseded_where.append(f"m.category_path <@ ${len(superseded_params)}::ltree")
+                superseded_params.append(safe_limit)
+                superseded_rows = await conn.fetch(
+                    f"""
+                    SELECT
+                        m.id,
+                        m.content,
+                        m.category_path::text AS category_path,
+                        m.supersedes_id,
+                        m.updated_at
+                    FROM memories m
+                    WHERE {' AND '.join(superseded_where)}
+                    ORDER BY m.updated_at DESC
+                    LIMIT ${len(superseded_params)}
+                    """,
+                    *superseded_params,
+                )
+
+            audit_rows = []
+            if audit_table_exists:
+                try:
+                    audit_params: list[Any] = [safe_since_days]
+                    audit_where = ["e.created_at >= NOW() - ($1::int * INTERVAL '1 day')"]
+                    if safe_category_path:
+                        audit_params.append(safe_category_path)
+                        audit_where.append(f"e.category_path <@ ${len(audit_params)}::ltree")
+                    audit_params.append(safe_limit)
+                    audit_rows = await conn.fetch(
+                        f"""
+                        SELECT
+                            e.id,
+                            e.created_at,
+                            e.new_memory_id,
+                            e.old_memory_id,
+                            e.resolution,
+                            e.category_path::text AS category_path,
+                            e.details::text AS details,
+                            COALESCE(new_m.content, old_m.content) AS summary_content
+                        FROM conflict_audit_events e
+                        LEFT JOIN memories new_m ON new_m.id = e.new_memory_id
+                        LEFT JOIN memories old_m ON old_m.id = e.old_memory_id
+                        WHERE {' AND '.join(audit_where)}
+                        ORDER BY e.created_at DESC
+                        LIMIT ${len(audit_params)}
+                        """,
+                        *audit_params,
+                    )
+                except Exception as audit_exc:
+                    if getattr(audit_exc, "sqlstate", None) == "42P01":
+                        logger.warning("decision_timeline degraded mode: conflict_audit_events unavailable")
+                        audit_rows = []
+                        audit_table_exists = False
+                    else:
+                        raise
+
+        for r in created_rows:
+            summary = _timeline_excerpt(r["content"])
+            item = {
+                "timestamp": r["created_at"].isoformat(),
+                "event_type": "memory_created",
+                "memory_id": str(r["id"]),
+                "category_path": r["category_path"],
+                "summary": f"Created memory: {summary}" if summary else "Created memory.",
+            }
+            if r["supersedes_id"] is not None:
+                item["superseded_by"] = str(r["supersedes_id"])
+            item["_sort_ts"] = r["created_at"]
+            events.append(item)
+
+        for r in updated_rows:
+            summary = _timeline_excerpt(r["content"])
+            item = {
+                "timestamp": r["updated_at"].isoformat(),
+                "event_type": "memory_updated",
+                "memory_id": str(r["id"]),
+                "category_path": r["category_path"],
+                "summary": f"Updated memory: {summary}" if summary else "Updated memory.",
+                "_sort_ts": r["updated_at"],
+            }
+            events.append(item)
+
+        for r in superseded_rows:
+            summary = _timeline_excerpt(r["content"])
+            item = {
+                "timestamp": r["updated_at"].isoformat(),
+                "event_type": "memory_superseded",
+                "memory_id": str(r["id"]),
+                "category_path": r["category_path"],
+                "summary": f"Memory superseded: {summary}" if summary else "Memory superseded.",
+                "_sort_ts": r["updated_at"],
+            }
+            if r["supersedes_id"] is not None:
+                item["superseded_by"] = str(r["supersedes_id"])
+            events.append(item)
+
+        for r in audit_rows:
+            details = json.loads(r["details"]) if r["details"] else {}
+            reason = details.get("reason_summary") if isinstance(details, dict) else None
+            summary = f"Conflict resolved via {r['resolution']}."
+            if reason:
+                summary += f" {_timeline_excerpt(str(reason), max_len=100) or ''}".rstrip()
+            else:
+                excerpt = _timeline_excerpt(r["summary_content"])
+                if excerpt:
+                    summary += f" {excerpt}"
+
+            item = {
+                "timestamp": r["created_at"].isoformat(),
+                "event_type": "conflict_resolved",
+                "memory_id": str(r["new_memory_id"] or r["old_memory_id"]) if (r["new_memory_id"] or r["old_memory_id"]) else None,
+                "category_path": r["category_path"] or "reference.unknown",
+                "summary": summary,
+                "audit_event_id": str(r["id"]),
+                "_sort_ts": r["created_at"],
+            }
+            if r["old_memory_id"] is not None:
+                item["supersedes"] = str(r["old_memory_id"])
+            events.append(item)
+
+        events.sort(key=lambda e: (e["_sort_ts"], e["event_type"], e["memory_id"]))
+        if len(events) > safe_limit:
+            events = events[-safe_limit:]
+        for e in events:
+            e.pop("_sort_ts", None)
+
+        return {
+            "ok": True,
+            "count": len(events),
+            "events": events,
+            "filters": {
+                "category_path": safe_category_path,
+                "since_days": safe_since_days,
+                "limit": safe_limit,
+                "include_superseded": bool(include_superseded),
+            },
+            "audit_source_available": audit_table_exists,
+        }
+    except Exception as e:
+        logger.error("Error in decision_timeline: %s\n%s", e, traceback.format_exc())
+        return {"ok": False, "error": str(e)}
+
+
 async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
     """Deterministically build a System Primer from SQL aggregation. No LLM calls."""
     from llm import summarize_user_profile
@@ -309,6 +574,7 @@ async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
             f"- `list_categories()` — all paths with counts\n"
             f"- `fetch_document(memory_id)` — reconstruct full document from chunk chain\n"
             f"- `trace_history(memory_id)` — inspect supersession chain for a fact\n"
+            f"- `decision_timeline(...)` — view chronological decision changes across memories and audit events\n"
             f"- `contradiction_audit(...)` — inspect conflict-resolution audit events and reason payloads\n"
             f"- `explore_taxonomy(path)` — expand a collapsed '[+N more]' branch\n"
             f"- `check_ingestion_status(job_id)` — poll async ingestion progress\n"

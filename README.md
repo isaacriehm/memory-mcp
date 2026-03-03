@@ -171,6 +171,7 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | `explore_taxonomy` | Drill into a collapsed `[+N more]` branch from `list_categories`. |
 | `fetch_document` | Reconstruct a full document by following `sequence_next` edges from a memory ID. |
 | `trace_history` | Inspect the full supersession chain (oldest → newest) for a memory. |
+| `decision_timeline` | Return chronological decision events (`memory_created`, `memory_updated`, `memory_superseded`, `conflict_resolved`) with optional category/time filters. |
 | `contradiction_audit` | Inspect recent conflict-resolution events with optional category, resolution, and time filters. |
 | `confirm_memory_validity` | Confirm an aging memory is still accurate. Advances its `verify_after` date. |
 | `update_memory` | Rewrite a memory's content in-place (preserves identity, edges, history). |
