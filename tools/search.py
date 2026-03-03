@@ -1,5 +1,6 @@
 """Search and taxonomy retrieval tools."""
 
+import hashlib
 import json
 import re
 import traceback
@@ -8,14 +9,271 @@ from uuid import UUID
 
 from fastmcp import Context
 
-from config import logger, DEFAULT_SEARCH_LIMIT
+from config import (
+    logger,
+    DEFAULT_SEARCH_LIMIT,
+    FEEDBACK_RERANK_ENABLED,
+    FEEDBACK_MAX_DELTA,
+    FEEDBACK_HALF_LIFE_DAYS,
+    CANONICAL_MIN_IN_TOPK,
+    HISTORICAL_MIN_IN_TOPK,
+    FEEDBACK_EXPLORATION_SLOTS,
+)
 from utils import _now, _vector_literal, _add_ttl_warning, sanitize_ltree_path, sanitize_ltree_label
 from llm import embed, semantic_diff
 from db import get_pool
 
 
+def _hash_query(query: str, category_path: str, task_type: Optional[str] = None) -> str:
+    normalized = " ".join(query.lower().split())
+    category_scope = sanitize_ltree_path(category_path.strip()).lower()
+
+    task_scope = ""
+    if task_type and str(task_type).strip():
+        task_scope = str(task_type).strip().lower()[:120]
+
+    scoped = f"q={normalized}|cat={category_scope}|task={task_scope or '*'}"
+    return hashlib.sha256(scoped.encode("utf-8")).hexdigest()
+
+
+def _normalize_outcome(outcome: Any) -> tuple[bool, int | str]:
+    if isinstance(outcome, bool):
+        return False, "outcome must be +1 or -1"
+    if isinstance(outcome, int):
+        if outcome in (-1, 1):
+            return True, outcome
+        return False, "outcome must be +1 or -1"
+    if isinstance(outcome, str):
+        norm = outcome.strip().lower()
+        if norm in {"1", "+1", "helpful", "positive", "up"}:
+            return True, 1
+        if norm in {"-1", "not_helpful", "not-helpful", "negative", "down"}:
+            return True, -1
+    return False, "outcome must be +1 or -1"
+
+
+def _infer_memory_tier(category_path: str, metadata: dict[str, Any]) -> str:
+    tier_raw = metadata.get("tier") or metadata.get("memory_tier")
+    if isinstance(tier_raw, str):
+        tier_norm = tier_raw.strip().lower()
+        if tier_norm in {"canonical", "historical", "ephemeral"}:
+            return tier_norm
+
+    path_norm = (category_path or "").strip().lower()
+    if path_norm.startswith("context_store"):
+        return "ephemeral"
+
+    segments = [seg for seg in re.split(r"[.\-_]", path_norm) if seg]
+
+    historical_markers = {"history", "historical", "archive", "archives", "log", "logs", "changelog", "retrospective"}
+    if any(seg in historical_markers for seg in segments):
+        return "historical"
+
+    canonical_markers = {"decision", "decisions", "architecture", "strategy", "roadmap", "primer", "principles"}
+    root = path_norm.split(".", 1)[0] if path_norm else ""
+    if root in {"profile", "projects", "reference", "organizations", "concepts"}:
+        return "canonical"
+    if any(seg in canonical_markers for seg in segments):
+        return "canonical"
+    return "other"
+
+
+def _effective_tier_requirements(candidates: list[dict[str, Any]], limit: int) -> dict[str, int]:
+    available_by_tier = {
+        "canonical": sum(1 for item in candidates if item.get("tier") == "canonical"),
+        "historical": sum(1 for item in candidates if item.get("tier") == "historical"),
+    }
+    required_raw = {
+        "canonical": CANONICAL_MIN_IN_TOPK,
+        "historical": HISTORICAL_MIN_IN_TOPK,
+    }
+    required: dict[str, int] = {}
+    remaining_slots = limit
+    for tier, floor in required_raw.items():
+        if floor <= 0 or remaining_slots <= 0:
+            continue
+        assigned = min(int(floor), int(available_by_tier.get(tier, 0)), remaining_slots)
+        if assigned > 0:
+            required[tier] = assigned
+            remaining_slots -= assigned
+    return required
+
+
+def _select_removal_index(selected: list[dict[str, Any]], required_by_tier: dict[str, int]) -> Optional[int]:
+    selected_sorted = sorted(
+        enumerate(selected),
+        key=lambda pair: (float(pair[1]["adjusted_score"]), float(pair[1]["base_score"])),
+    )
+    for idx, _ in selected_sorted:
+        tier = selected[idx].get("tier", "other")
+        if tier in required_by_tier:
+            current_count = sum(1 for item in selected if item.get("tier") == tier)
+            if current_count <= required_by_tier[tier]:
+                continue
+        return idx
+    return None
+
+
+def _enforce_tier_floors(
+    ranked_candidates: list[dict[str, Any]],
+    limit: int,
+    required_by_tier: dict[str, int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    selected = list(ranked_candidates[:limit])
+    unselected = list(ranked_candidates[limit:])
+
+    for tier, required in required_by_tier.items():
+        while sum(1 for item in selected if item.get("tier") == tier) < required:
+            candidates_for_tier = [item for item in unselected if item.get("tier") == tier]
+            if not candidates_for_tier:
+                break
+            add_item = max(
+                candidates_for_tier,
+                key=lambda item: (float(item["adjusted_score"]), float(item["base_score"])),
+            )
+            remove_idx = _select_removal_index(selected, required_by_tier)
+            if remove_idx is None:
+                break
+
+            removed = selected.pop(remove_idx)
+            unselected.remove(add_item)
+            selected.append(add_item)
+            unselected.append(removed)
+
+            selected.sort(key=lambda item: float(item["adjusted_score"]), reverse=True)
+            unselected.sort(key=lambda item: float(item["adjusted_score"]), reverse=True)
+
+    return selected, unselected
+
+
+def _apply_exploration_slot(
+    selected: list[dict[str, Any]],
+    unselected: list[dict[str, Any]],
+    required_by_tier: dict[str, int],
+    slots: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if slots <= 0:
+        return selected, unselected
+
+    for _ in range(slots):
+        unexplored = [item for item in unselected if int(item.get("feedback_count", 0)) == 0]
+        if not unexplored:
+            break
+        promote_item = max(
+            unexplored,
+            key=lambda item: (float(item["base_score"]), float(item["adjusted_score"])),
+        )
+        remove_idx = _select_removal_index(selected, required_by_tier)
+        if remove_idx is None:
+            break
+
+        removed = selected.pop(remove_idx)
+        unselected.remove(promote_item)
+        selected.append(promote_item)
+        unselected.append(removed)
+
+        selected.sort(key=lambda item: float(item["adjusted_score"]), reverse=True)
+        unselected.sort(key=lambda item: float(item["adjusted_score"]), reverse=True)
+
+    return selected, unselected
+
+
+async def report_retrieval_outcome(
+    ctx: Context,
+    query: str,
+    memory_id: str,
+    outcome: int,
+    task_type: Optional[str] = None,
+    category_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Persist retrieval outcome feedback for future reranking.
+
+    outcome: +1 for helpful, -1 for not_helpful.
+    """
+    logger.info("Tool invoked: report_retrieval_outcome (memory_id: %s, task_type: %s)", memory_id, task_type)
+
+    if not query or not isinstance(query, str) or not query.strip():
+        return {"ok": False, "error": "query must be a non-empty string"}
+
+    ok, parsed_outcome = _normalize_outcome(outcome)
+    if not ok:
+        return {"ok": False, "error": str(parsed_outcome)}
+
+    try:
+        UUID(memory_id)
+    except Exception:
+        return {"ok": False, "error": "memory_id must be a valid UUID"}
+
+    task_type_clean: Optional[str] = None
+    if task_type is not None:
+        task_type_clean = str(task_type).strip()[:120] or None
+
+    scoped_category_path: Optional[str] = None
+    if category_path and category_path.strip():
+        try:
+            scoped_category_path = sanitize_ltree_path(category_path.strip())
+        except Exception:
+            return {"ok": False, "error": "category_path must be a valid ltree-style path"}
+
+    try:
+        ok_latest, resolved_memory_id = await _resolve_latest_active_memory_id(memory_id)
+        if not ok_latest:
+            return {"ok": False, "error": str(resolved_memory_id)}
+        target_memory_id = UUID(resolved_memory_id)
+
+        db_pool = get_pool()
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT category_path::text AS category_path
+                FROM memories
+                WHERE id = $1
+                  AND supersedes_id IS NULL
+                  AND archived_at IS NULL
+                """,
+                target_memory_id,
+            )
+            if not row:
+                return {"ok": False, "error": "memory_id not found or archived"}
+
+            memory_category_path = row["category_path"]
+            hash_paths = {memory_category_path}
+            if scoped_category_path:
+                hash_paths.add(scoped_category_path)
+            query_hashes = sorted(_hash_query(query, p, task_type_clean) for p in hash_paths)
+
+            for query_hash in query_hashes:
+                await conn.execute(
+                    """
+                    INSERT INTO retrieval_feedback (query_hash, memory_id, outcome, task_type, created_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    """,
+                    query_hash,
+                    target_memory_id,
+                    int(parsed_outcome),
+                    task_type_clean,
+                )
+
+        return {
+            "ok": True,
+            "memory_id": str(target_memory_id),
+            "query_hashes": query_hashes,
+            "outcome": int(parsed_outcome),
+            "task_type": task_type_clean,
+            "category_path": memory_category_path,
+        }
+    except Exception as e:
+        logger.error("Error in report_retrieval_outcome: %s\n%s", e, traceback.format_exc())
+        return {"ok": False, "error": str(e)}
+
+
 async def search_memory(
-    ctx: Context, query: str, category_path: Optional[str] = None, limit: int = DEFAULT_SEARCH_LIMIT
+    ctx: Context,
+    query: str,
+    category_path: Optional[str] = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    task_type: Optional[str] = None,
 ) -> dict[str, Any]:
     """Semantically search the knowledge base.
     Hybrid Retrieval: Use 'category_path' to filter by domains (e.g., 'projects.myapp' or 'user').
@@ -27,14 +285,19 @@ async def search_memory(
         return {"ok": False, "error": "query must be a non-empty string"}
 
     limit = max(1, min(int(limit or DEFAULT_SEARCH_LIMIT), 100))
+    candidate_limit = min(100, limit + 25) if FEEDBACK_RERANK_ENABLED else limit
     try:
         vec = await embed(query)
         vec_lit = _vector_literal(vec)
+        task_type_clean: Optional[str] = None
+        if task_type is not None:
+            task_type_clean = str(task_type).strip()[:120] or None
 
         db_pool = get_pool()
         async with db_pool.acquire() as conn:
             where_clause = "m.supersedes_id IS NULL AND m.archived_at IS NULL"
-            params = [vec_lit, limit, query]
+            params = [vec_lit, candidate_limit, query]
+            safe_path: Optional[str] = None
             if category_path and category_path.strip():
                 safe_path = sanitize_ltree_path(category_path.strip())
                 where_clause += f" AND m.category_path <@ ${len(params) + 1}::ltree"
@@ -90,33 +353,148 @@ async def search_memory(
                 *params,
             )
 
-            if rows:
-                ids = [r["id"] for r in rows]
+            if not rows:
+                logger.info("search_memory completed. Found 0 results.")
+                return {"ok": True, "results": []}
+
+            candidates: list[dict[str, Any]] = []
+            for r in rows:
+                metadata = json.loads(r["metadata"]) if r["metadata"] else {}
+                base_score = float(r["rrf_score"])
+                candidate = {
+                    "id": r["id"],
+                    "content": r["content"],
+                    "prev_content": r["prev_content"],
+                    "next_content": r["next_content"],
+                    "category_path": r["category_path"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "metadata": metadata,
+                    "tier": _infer_memory_tier(r["category_path"], metadata),
+                    "semantic_score": float(r["semantic_score"]),
+                    "keyword_score": float(r["keyword_score"]),
+                    "base_score": base_score,
+                    "adjusted_score": base_score,
+                    "feedback_signal": 0.0,
+                    "feedback_delta": 0.0,
+                    "feedback_count": 0,
+                }
+                candidates.append(candidate)
+
+            if FEEDBACK_RERANK_ENABLED and candidates:
+                candidate_ids = [item["id"] for item in candidates]
+                hash_set: set[str] = set()
+                if safe_path:
+                    hash_set.add(_hash_query(query, safe_path, task_type_clean))
+                for item in candidates:
+                    hash_set.add(_hash_query(query, item["category_path"], task_type_clean))
+                query_hashes = list(hash_set)
+
+                feedback_rows = await conn.fetch(
+                    """
+                    SELECT
+                        memory_id,
+                        COALESCE(
+                            SUM(
+                                outcome * POWER(
+                                    0.5,
+                                    GREATEST(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0, 0.0) / $2::double precision
+                                )
+                            ) / NULLIF(
+                                SUM(
+                                    POWER(
+                                        0.5,
+                                        GREATEST(EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0, 0.0) / $2::double precision
+                                    )
+                                ),
+                                0
+                            ),
+                            0.0
+                        ) AS signal,
+                        COUNT(*)::int AS feedback_count
+                    FROM retrieval_feedback
+                    WHERE query_hash = ANY($1::text[])
+                      AND memory_id = ANY($3::uuid[])
+                    GROUP BY memory_id
+                    """,
+                    query_hashes,
+                    FEEDBACK_HALF_LIFE_DAYS,
+                    candidate_ids,
+                )
+                feedback_by_id = {
+                    row["memory_id"]: {
+                        "signal": float(row["signal"]),
+                        "count": int(row["feedback_count"]),
+                    }
+                    for row in feedback_rows
+                }
+
+                for item in candidates:
+                    feedback = feedback_by_id.get(item["id"])
+                    if feedback:
+                        signal = max(-1.0, min(1.0, float(feedback["signal"])))
+                        delta = max(-FEEDBACK_MAX_DELTA, min(FEEDBACK_MAX_DELTA, signal * FEEDBACK_MAX_DELTA))
+                        bounded_score = max(
+                            item["base_score"] - FEEDBACK_MAX_DELTA,
+                            min(item["base_score"] + FEEDBACK_MAX_DELTA, item["base_score"] + delta),
+                        )
+                        item["feedback_signal"] = signal
+                        item["feedback_delta"] = bounded_score - item["base_score"]
+                        item["adjusted_score"] = bounded_score
+                        item["feedback_count"] = int(feedback["count"])
+
+            candidates.sort(
+                key=lambda item: (
+                    float(item["adjusted_score"]),
+                    float(item["base_score"]),
+                    float(item["semantic_score"]),
+                ),
+                reverse=True,
+            )
+
+            if FEEDBACK_RERANK_ENABLED:
+                required_by_tier = _effective_tier_requirements(candidates, limit)
+                selected, unselected = _enforce_tier_floors(candidates, limit, required_by_tier)
+                selected, _ = _apply_exploration_slot(
+                    selected,
+                    unselected,
+                    required_by_tier,
+                    min(FEEDBACK_EXPLORATION_SLOTS, max(0, limit - sum(required_by_tier.values()))),
+                )
+                final_candidates = selected[:limit]
+            else:
+                final_candidates = candidates[:limit]
+
+            ids = [item["id"] for item in final_candidates]
+            if ids:
                 await conn.execute("UPDATE memories SET last_accessed_at = $1 WHERE id = ANY($2)", _now(), ids)
 
-                results = []
-                for r in rows:
-                    full_content = r["content"]
-                    if r["prev_content"]:
-                        full_content = f"...{r['prev_content']}\n\n{full_content}"
-                    if r["next_content"]:
-                        full_content = f"{full_content}\n\n{r['next_content']}..."
+            results = []
+            for item in final_candidates:
+                full_content = item["content"]
+                if item["prev_content"]:
+                    full_content = f"...{item['prev_content']}\n\n{full_content}"
+                if item["next_content"]:
+                    full_content = f"{full_content}\n\n{item['next_content']}..."
 
-                    item = {
-                        "id": str(r["id"]),
-                        "content": full_content,
-                        "category_path": r["category_path"],
-                        "score": round(float(r["rrf_score"]), 6),
-                        "semantic_score": round(float(r["semantic_score"]), 6),
-                        "keyword_score": round(float(r["keyword_score"]), 6),
-                        "created_at": r["created_at"].isoformat(),
-                        "updated_at": r["updated_at"].isoformat(),
-                        "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
-                    }
-                    _add_ttl_warning(item, r["updated_at"])
-                    results.append(item)
-            else:
-                results = []
+                result_item = {
+                    "id": str(item["id"]),
+                    "content": full_content,
+                    "category_path": item["category_path"],
+                    "score": round(float(item["adjusted_score"]), 6),
+                    "semantic_score": round(float(item["semantic_score"]), 6),
+                    "keyword_score": round(float(item["keyword_score"]), 6),
+                    "created_at": item["created_at"].isoformat(),
+                    "updated_at": item["updated_at"].isoformat(),
+                    "metadata": item["metadata"],
+                }
+                if FEEDBACK_RERANK_ENABLED:
+                    result_item["base_score"] = round(float(item["base_score"]), 6)
+                    result_item["feedback_delta"] = round(float(item["feedback_delta"]), 6)
+                    result_item["feedback_signal"] = round(float(item["feedback_signal"]), 6)
+                    result_item["tier"] = item["tier"]
+                _add_ttl_warning(result_item, item["updated_at"])
+                results.append(result_item)
 
         results.sort(key=lambda r: r.get("is_expired", False))
         logger.info("search_memory completed. Found %d results.", len(results))

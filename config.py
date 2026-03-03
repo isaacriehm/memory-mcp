@@ -2,6 +2,14 @@ import os
 import logging
 from openai import AsyncOpenAI
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ----------------------------
 # Config & Logging Setup
 # ----------------------------
@@ -51,13 +59,23 @@ CONTEXT_DEFAULT_TTL_HOURS = int(os.getenv("CONTEXT_DEFAULT_TTL_HOURS", "24"))
 CONTEXT_MAX_VALUE_LENGTH = int(os.getenv("CONTEXT_MAX_VALUE_LENGTH", "50000"))
 CONTEXT_MAX_KEY_LENGTH = int(os.getenv("CONTEXT_MAX_KEY_LENGTH", "200"))
 
+# Feedback-guided retrieval (safe defaults)
+FEEDBACK_RERANK_ENABLED = _env_bool("FEEDBACK_RERANK_ENABLED", False)
+FEEDBACK_MAX_DELTA = max(0.0, float(os.getenv("FEEDBACK_MAX_DELTA", "0.05")))
+FEEDBACK_HALF_LIFE_DAYS = max(1.0, float(os.getenv("FEEDBACK_HALF_LIFE_DAYS", "30")))
+CANONICAL_MIN_IN_TOPK = max(0, int(os.getenv("CANONICAL_MIN_IN_TOPK", "2")))
+HISTORICAL_MIN_IN_TOPK = max(0, int(os.getenv("HISTORICAL_MIN_IN_TOPK", "1")))
+FEEDBACK_EXPLORATION_SLOTS = max(0, int(os.getenv("FEEDBACK_EXPLORATION_SLOTS", "0")))
+
 logger.info(
     "Config loaded: EMBEDDING_MODEL=%s EXTRACT_MODEL=%s CONFLICT_MODEL=%s EMBED_DIM=%d "
-    "SEARCH_LIMIT=%d LIST_LIMIT=%d TIMEOUT=%.1fs MAX_RETRIES=%d CONCURRENCY=%d PG_POOL=%d-%d",
+    "SEARCH_LIMIT=%d LIST_LIMIT=%d TIMEOUT=%.1fs MAX_RETRIES=%d CONCURRENCY=%d PG_POOL=%d-%d "
+    "FEEDBACK_RERANK=%s FEEDBACK_MAX_DELTA=%.3f FEEDBACK_HALF_LIFE_DAYS=%.1f",
     EMBEDDING_MODEL, EXTRACT_MODEL, CONFLICT_MODEL, EMBED_DIM,
     DEFAULT_SEARCH_LIMIT, DEFAULT_LIST_LIMIT,
     OPENAI_TIMEOUT_S, OPENAI_MAX_RETRIES, MAX_CONCURRENT_API_CALLS,
     PG_POOL_MIN, PG_POOL_MAX,
+    FEEDBACK_RERANK_ENABLED, FEEDBACK_MAX_DELTA, FEEDBACK_HALF_LIFE_DAYS,
 )
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_S)

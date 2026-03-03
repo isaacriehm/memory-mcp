@@ -156,6 +156,31 @@ async def init_db(conn: asyncpg.Connection) -> None:
 
     await conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS retrieval_feedback (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            query_hash TEXT NOT NULL,
+            memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            outcome SMALLINT NOT NULL CHECK (outcome IN (-1, 1)),
+            task_type TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS retrieval_feedback_query_memory_created_idx "
+        "ON retrieval_feedback (query_hash, memory_id, created_at DESC);"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS retrieval_feedback_memory_created_idx "
+        "ON retrieval_feedback (memory_id, created_at DESC);"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS retrieval_feedback_created_idx "
+        "ON retrieval_feedback (created_at DESC);"
+    )
+
+    await conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS context_store (
             key VARCHAR(200) PRIMARY KEY,
             value TEXT NOT NULL,

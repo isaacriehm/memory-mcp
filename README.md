@@ -166,7 +166,8 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | `initialize_context` | **Call first every session.** Returns the System Primer + verification prompts for aging memories. |
 | `memorize_context` | Ingest raw text. Automatically chunks, embeds, categorizes, and deduplicates. Supports `ttl_days`. |
 | `check_ingestion_status` | Poll async ingestion job by `job_id`. Returns `pending`, `processing`, `complete`, or `failed`. |
-| `search_memory` | Hybrid vector + BM25 search with Reciprocal Rank Fusion. Filter by `category_path`. |
+| `search_memory` | Hybrid vector + BM25 search with Reciprocal Rank Fusion. Supports optional, bounded feedback rerank behind a kill switch. Filter by `category_path`; optional `task_type` scopes feedback influence. |
+| `report_retrieval_outcome` | Record retrieval feedback (`+1` helpful, `-1` not helpful) for a query-memory pair. Superseded IDs auto-resolve to the latest active memory. Optional `category_path`/`task_type` scope feedback influence. |
 | `list_categories` | Return all occupied taxonomy paths with memory counts. |
 | `explore_taxonomy` | Drill into a collapsed `[+N more]` branch from `list_categories`. |
 | `fetch_document` | Reconstruct a full document by following `sequence_next` edges from a memory ID. |
@@ -196,6 +197,23 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | `run_diagnostics` | Report on pool health, memory counts, ingestion queue depth. |
 | `get_ingestion_stats` | Breakdown of ingestion job statuses. |
 | `flush_staging` | Clear all completed/failed staging jobs immediately. |
+
+---
+
+## Feedback Rerank Rollout
+
+Feedback reranking is intentionally guarded:
+
+- Base retrieval (semantic + keyword + RRF) always stays primary.
+- Feedback is a bounded secondary adjustment (`FEEDBACK_MAX_DELTA`, default `0.05`).
+- Tier floors can protect diversity in top-K (`CANONICAL_MIN_IN_TOPK`, `HISTORICAL_MIN_IN_TOPK`).
+- Collection can stay on while rerank is off.
+
+Rollback is immediate:
+
+```env
+FEEDBACK_RERANK_ENABLED=false
+```
 
 ---
 
@@ -263,6 +281,17 @@ Copy `.env.example` to `.env` and fill in your values.
 | `RELATES_TO_THRESHOLD` | `0.65` | Similarity threshold for `relates_to` edge creation |
 | `MIN_SECTION_LENGTH` | `100` | Minimum character length for a chunk to be stored |
 | `MAX_TAXONOMY_PATHS` | `40` | Max taxonomy paths assigned per ingestion |
+
+### Optional — Feedback Rerank (Guarded)
+
+| Variable | Default | Description |
+|---|---|---|
+| `FEEDBACK_RERANK_ENABLED` | `false` | Kill switch for applying feedback rerank in `search_memory`. |
+| `FEEDBACK_MAX_DELTA` | `0.05` | Max absolute score adjustment from feedback (bounded around base score). |
+| `FEEDBACK_HALF_LIFE_DAYS` | `30` | Exponential decay half-life for older feedback events. |
+| `CANONICAL_MIN_IN_TOPK` | `2` | Minimum canonical memories kept in top-K when available. |
+| `HISTORICAL_MIN_IN_TOPK` | `1` | Minimum historical memories kept in top-K when available. |
+| `FEEDBACK_EXPLORATION_SLOTS` | `0` | Optional number of top-K slots reserved for underexplored candidates. |
 
 ### Optional — OpenAI & Concurrency
 

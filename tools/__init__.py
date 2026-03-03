@@ -1,7 +1,14 @@
 """Memory MCP tools package."""
 
 from .ingestion import memorize_context, check_ingestion_status
-from .search import search_memory, list_categories, explore_taxonomy, fetch_document, semantic_diff_memory
+from .search import (
+    search_memory,
+    list_categories,
+    explore_taxonomy,
+    fetch_document,
+    semantic_diff_memory,
+    report_retrieval_outcome,
+)
 from .context import (
     initialize_context,
     trace_history,
@@ -24,6 +31,7 @@ __all__ = [
     "memorize_context",
     "check_ingestion_status",
     "search_memory",
+    "report_retrieval_outcome",
     "list_categories",
     "explore_taxonomy",
     "fetch_document",

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-03-03
+
+### Added
+- New `retrieval_feedback` table for persistent query-memory outcome events (`+1` helpful, `-1` not helpful) with indexes for rerank lookups.
+- New MCP tool `report_retrieval_outcome` (production and admin) to record retrieval outcomes without mutating memory content.
+- New guarded feedback rerank pipeline in `search_memory` behind `FEEDBACK_RERANK_ENABLED` (default `false`), using time-decayed feedback and bounded score delta (`FEEDBACK_MAX_DELTA`).
+- Tier safeguards for top-K (`CANONICAL_MIN_IN_TOPK`, `HISTORICAL_MIN_IN_TOPK`) and optional exploration slots (`FEEDBACK_EXPLORATION_SLOTS`) to reduce lock-in risk.
+
+### Changed
+- `search_memory` now returns optional diagnostics (`base_score`, `feedback_delta`, `feedback_signal`, `tier`) only when feedback rerank is enabled.
+- Configuration/docs updated with explicit rollout and rollback controls for feedback reranking.
+- Tier floor requirements now normalize against `top_k` to prevent over-subscribed floor constraints.
+- Retrieval feedback now resolves superseded IDs to the latest active memory and applies scoped hashing by category/task to avoid cross-scope bleed.
+
 ## [1.4.0] - 2026-03-03
 
 ### Added
