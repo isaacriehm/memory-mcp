@@ -3,6 +3,8 @@
 import json
 import traceback
 import asyncio
+import re
+from datetime import timedelta
 from typing import Optional, Any
 from uuid import UUID
 
@@ -15,6 +17,8 @@ from db import get_pool, _compute_verify_after
 import db
 
 from .search import _build_taxonomy_tree
+
+_HANDOFF_LABEL_RE = re.compile(r"[^a-z0-9._-]+")
 
 
 async def initialize_context(ctx: Context) -> dict[str, Any]:
@@ -247,6 +251,53 @@ def _timeline_excerpt(text: Optional[str], max_len: int = 140) -> Optional[str]:
     if len(sentence) <= max_len:
         return sentence
     return sentence[: max_len - 3] + "..."
+
+
+def _sanitize_handoff_label(label: str) -> str:
+    compact = str(label or "").strip().lower()
+    compact = _HANDOFF_LABEL_RE.sub("-", compact)
+    compact = re.sub(r"-{2,}", "-", compact)
+    compact = compact.strip(".-_")
+    return compact or "handoff"
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _shorten(text: Optional[str], max_len: int = 220) -> str:
+    if not text:
+        return ""
+    compact = " ".join(text.split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3] + "..."
+
+
+async def _load_contradiction_snapshot(
+    ctx: Context,
+    category_path: Optional[str],
+    since_days: int,
+    limit: int,
+) -> dict[str, Any]:
+    try:
+        from .admin_tools import contradiction_audit
+    except Exception:
+        return {"ok": False, "error": "unavailable"}
+
+    try:
+        return await contradiction_audit(
+            ctx,
+            category_path=category_path,
+            since_days=since_days,
+            limit=limit,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 async def decision_timeline(
@@ -492,6 +543,236 @@ async def decision_timeline(
         }
     except Exception as e:
         logger.error("Error in decision_timeline: %s\n%s", e, traceback.format_exc())
+        return {"ok": False, "error": str(e)}
+
+
+async def create_handoff_pack(
+    ctx: Context,
+    label: str,
+    goal: str,
+    ttl_hours: int = 72,
+    include_recent_hours: int = 48,
+    category_path: Optional[str] = None,
+    max_context_items: int = 12,
+) -> dict[str, Any]:
+    """
+    Create a deterministic, execution-ready handoff pack and store it under
+    `handoff.<label>` in the context store.
+    """
+    logger.info(
+        "Tool invoked: create_handoff_pack (label=%s, ttl_hours=%s, include_recent_hours=%s, category_path=%s, max_context_items=%s)",
+        label, ttl_hours, include_recent_hours, category_path, max_context_items,
+    )
+
+    if not label or not isinstance(label, str) or not label.strip():
+        return {"ok": False, "error": "label must be a non-empty string"}
+    if not goal or not isinstance(goal, str) or not goal.strip():
+        return {"ok": False, "error": "goal must be a non-empty string"}
+
+    safe_label = _sanitize_handoff_label(label)
+    key = f"handoff.{safe_label}"
+    resume_prompt = f"Execute pending handoff: {safe_label}"
+    safe_ttl = _clamp_int(ttl_hours, default=72, minimum=1, maximum=720)
+    safe_recent_hours = _clamp_int(include_recent_hours, default=48, minimum=1, maximum=720)
+    safe_max_items = _clamp_int(max_context_items, default=12, minimum=1, maximum=25)
+    safe_category_path = None
+    if category_path and str(category_path).strip():
+        safe_category_path = sanitize_ltree_path(str(category_path).strip())
+
+    days_window = max(1, (safe_recent_hours + 23) // 24)
+    now = _now()
+
+    try:
+        db_pool = get_pool()
+        async with db_pool.acquire() as conn:
+            mem_where = [
+                "supersedes_id IS NULL",
+                "archived_at IS NULL",
+                "(lexical_search @@ websearch_to_tsquery('english', $1) OR content ILIKE $2)",
+            ]
+            mem_params: list[Any] = [goal.strip(), f"%{goal.strip()}%"]
+            if safe_category_path:
+                mem_params.append(safe_category_path)
+                mem_where.append(f"category_path <@ ${len(mem_params)}::ltree")
+            mem_params.append(safe_max_items)
+            memory_rows = await conn.fetch(
+                f"""
+                SELECT
+                    id,
+                    category_path::text AS category_path,
+                    content,
+                    updated_at,
+                    ts_rank_cd(lexical_search, websearch_to_tsquery('english', $1)) AS lexical_rank
+                FROM memories
+                WHERE {' AND '.join(mem_where)}
+                ORDER BY lexical_rank DESC, updated_at DESC
+                LIMIT ${len(mem_params)}
+                """,
+                *mem_params,
+            )
+
+            context_rows = await conn.fetch(
+                """
+                SELECT key, scope, value, updated_at, expires_at
+                FROM context_store
+                WHERE expires_at > NOW()
+                  AND scope != 'handoff'
+                  AND updated_at >= NOW() - ($1 * INTERVAL '1 hour')
+                ORDER BY updated_at DESC
+                LIMIT $2
+                """,
+                safe_recent_hours,
+                safe_max_items,
+            )
+
+            timeline = await decision_timeline(
+                ctx,
+                category_path=safe_category_path,
+                since_days=days_window,
+                limit=min(safe_max_items, 10),
+                include_superseded=True,
+            )
+            contradiction = await _load_contradiction_snapshot(
+                ctx,
+                category_path=safe_category_path,
+                since_days=days_window,
+                limit=min(safe_max_items, 10),
+            )
+
+            touched_entities: list[tuple[str, str]] = []
+            for row in memory_rows:
+                touched_entities.append((str(row["id"]), row["category_path"]))
+
+            constraints = [
+                f"- Persist output to `{key}` with scope `handoff`",
+                f"- TTL: {safe_ttl} hours",
+                f"- Context window: last {safe_recent_hours} hours",
+                f"- Max context items per source: {safe_max_items}",
+            ]
+            if safe_category_path:
+                constraints.append(f"- Category scope: `{safe_category_path}`")
+            else:
+                constraints.append("- Category scope: global")
+
+            decision_lines: list[str] = []
+            if memory_rows:
+                decision_lines.append("### Relevant memories")
+                for row in memory_rows:
+                    decision_lines.append(
+                        f"- `{row['id']}` ({row['category_path']}): {_shorten(row['content'], 180)}"
+                    )
+            if context_rows:
+                decision_lines.append("### Recent context keys")
+                for row in context_rows:
+                    decision_lines.append(
+                        f"- `{row['key']}` [{row['scope']}] updated {row['updated_at'].isoformat()}: "
+                        f"{_shorten(row['value'], 140)}"
+                    )
+
+            timeline_events = timeline.get("events", []) if isinstance(timeline, dict) and timeline.get("ok") else []
+            if timeline_events:
+                decision_lines.append("### Timeline signals")
+                for event in timeline_events[:min(len(timeline_events), safe_max_items)]:
+                    decision_lines.append(
+                        f"- {event.get('timestamp', '')} {event.get('event_type', 'event')}: {event.get('summary', '')}"
+                    )
+
+            contradiction_events = (
+                contradiction.get("events", [])
+                if isinstance(contradiction, dict) and contradiction.get("ok")
+                else []
+            )
+            if contradiction_events:
+                decision_lines.append("### Conflict audit signals")
+                for event in contradiction_events[:min(len(contradiction_events), safe_max_items)]:
+                    decision_lines.append(
+                        f"- {event.get('created_at', '')} {event.get('resolution', 'unknown')}: "
+                        f"{_shorten(event.get('summary'), 150)}"
+                    )
+
+            risks: list[str] = []
+            if not memory_rows:
+                risks.append("- No matching active memories were found for the goal query.")
+            if not context_rows:
+                risks.append("- No recent non-handoff context entries were available in the selected time window.")
+            if not timeline_events:
+                risks.append("- Decision timeline data is unavailable or empty for the selected scope.")
+            if isinstance(contradiction, dict) and not contradiction.get("ok"):
+                risks.append("- Contradiction audit source unavailable; pack excludes conflict-resolution detail.")
+
+            if not risks:
+                risks.append("- No immediate blockers detected from retrieved context sources.")
+
+            touched_lines = [
+                f"- memory `{memory_id}` in `{category}`" for memory_id, category in touched_entities
+            ]
+            if not touched_lines:
+                touched_lines = ["- none"]
+
+            next_steps = [
+                "- Load this handoff key and execute against the specified goal.",
+                "- Validate behavior with focused checks for modified code paths.",
+                "- Report what changed, what remains, and any newly introduced risks.",
+            ]
+            success_checks = [
+                "- Goal outcome is implemented and verifiable.",
+                "- No unresolved blockers remain in open risks.",
+                "- Handoff key can be deleted after execution completes.",
+            ]
+
+            pack = "\n".join([
+                f"# Handoff Pack: {safe_label}",
+                "",
+                "## Goal",
+                goal.strip(),
+                "",
+                "## Constraints",
+                *constraints,
+                "",
+                "## Decisions/Context",
+                *(decision_lines or ["- No context signals were found."]),
+                "",
+                "## Touched entities (memory IDs/categories)",
+                *touched_lines,
+                "",
+                "## Open risks",
+                *risks,
+                "",
+                "## Next steps",
+                *next_steps,
+                "",
+                "## Success checks",
+                *success_checks,
+            ])
+
+            expires_at = now + timedelta(hours=safe_ttl)
+            await conn.execute(
+                """
+                INSERT INTO context_store (key, value, scope, created_at, updated_at, expires_at)
+                VALUES ($1, $2, $3, $4, $4, $5)
+                ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value,
+                        scope = EXCLUDED.scope,
+                        updated_at = EXCLUDED.updated_at,
+                        expires_at = EXCLUDED.expires_at
+                """,
+                key,
+                pack,
+                "handoff",
+                now,
+                expires_at,
+            )
+
+        preview = pack[:280] + ("..." if len(pack) > 280 else "")
+        return {
+            "ok": True,
+            "key": key,
+            "resume_prompt": resume_prompt,
+            "expires_at": expires_at.isoformat(),
+            "pack_preview": preview,
+        }
+    except Exception as e:
+        logger.error("Error in create_handoff_pack: %s\n%s", e, traceback.format_exc())
         return {"ok": False, "error": str(e)}
 
 

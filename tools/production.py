@@ -1,7 +1,7 @@
 from fastmcp import FastMCP
 from .ingestion import memorize_context, check_ingestion_status
 from .search import search_memory, list_categories, explore_taxonomy, fetch_document, semantic_diff_memory
-from .context import initialize_context, trace_history, confirm_memory_validity, decision_timeline
+from .context import initialize_context, trace_history, confirm_memory_validity, decision_timeline, create_handoff_pack
 from .crud import update_memory
 from .admin_tools import contradiction_audit
 from tools_context import register_context_tools
@@ -18,6 +18,7 @@ mcp.tool()(fetch_document)
 mcp.tool()(semantic_diff_memory)
 mcp.tool()(trace_history)
 mcp.tool()(decision_timeline)
+mcp.tool()(create_handoff_pack)
 mcp.tool()(confirm_memory_validity)
 mcp.tool()(update_memory)
 mcp.tool()(contradiction_audit)

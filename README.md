@@ -173,6 +173,7 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | `semantic_diff_memory` | Compare two memory IDs and return semantic `added/removed/changed` meaning deltas with risk notes. |
 | `trace_history` | Inspect the full supersession chain (oldest → newest) for a memory. |
 | `decision_timeline` | Return chronological decision events (`memory_created`, `memory_updated`, `memory_superseded`, `conflict_resolved`) with optional category/time filters. |
+| `create_handoff_pack` | Build and store a deterministic execution handoff at `handoff.<label>` and return a ready-to-paste resume prompt. |
 | `contradiction_audit` | Inspect recent conflict-resolution events with optional category, resolution, and time filters. |
 | `confirm_memory_validity` | Confirm an aging memory is still accurate. Advances its `verify_after` date. |
 | `update_memory` | Rewrite a memory's content in-place (preserves identity, edges, history). |

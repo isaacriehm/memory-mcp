@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-03-03
+
+### Added
+- New MCP tool `create_handoff_pack` (production and admin) that builds deterministic, execution-ready handoff packs and stores them under `handoff.<label>` in context store.
+- Handoff pack generation now includes scoped memory search, recent context key capture, timeline signal snapshot, and optional contradiction audit snapshot.
+- Input hygiene for handoff creation: label slug sanitization, bounded TTL/hour/item clamps, and deterministic resume prompt format.
+- Async unit tests for handoff pack creation success path, resume prompt formatting, and label sanitization with overwrite (`ON CONFLICT`) behavior.
+
 ## [1.3.0] - 2026-03-03
 
 ### Added
