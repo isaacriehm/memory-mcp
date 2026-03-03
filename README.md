@@ -170,6 +170,7 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | `list_categories` | Return all occupied taxonomy paths with memory counts. |
 | `explore_taxonomy` | Drill into a collapsed `[+N more]` branch from `list_categories`. |
 | `fetch_document` | Reconstruct a full document by following `sequence_next` edges from a memory ID. |
+| `semantic_diff_memory` | Compare two memory IDs and return semantic `added/removed/changed` meaning deltas with risk notes. |
 | `trace_history` | Inspect the full supersession chain (oldest → newest) for a memory. |
 | `decision_timeline` | Return chronological decision events (`memory_created`, `memory_updated`, `memory_superseded`, `conflict_resolved`) with optional category/time filters. |
 | `contradiction_audit` | Inspect recent conflict-resolution events with optional category, resolution, and time filters. |

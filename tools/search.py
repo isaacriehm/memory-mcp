@@ -1,6 +1,7 @@
 """Search and taxonomy retrieval tools."""
 
 import json
+import re
 import traceback
 from typing import Optional, Any
 from uuid import UUID
@@ -9,7 +10,7 @@ from fastmcp import Context
 
 from config import logger, DEFAULT_SEARCH_LIMIT
 from utils import _now, _vector_literal, _add_ttl_warning, sanitize_ltree_path, sanitize_ltree_label
-from llm import embed
+from llm import embed, semantic_diff
 from db import get_pool
 
 
@@ -216,6 +217,130 @@ async def fetch_document(ctx: Context, memory_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.error("Error in fetch_document: %s\n%s", e, traceback.format_exc())
         return {"ok": False, "error": str(e)}
+
+
+def _fallback_snippet(text: str, max_chars: int = 120) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    source = lines[0] if lines else text.strip()
+    compact = " ".join(source.split())
+    return compact[:max_chars] if compact else "(empty)"
+
+
+def _fallback_token_set(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+
+
+def _build_semantic_diff_fallback(
+    left_doc: dict[str, Any], right_doc: dict[str, Any], err: Exception, max_bullets: int
+) -> dict[str, Any]:
+    left_content = str(left_doc.get("content", ""))
+    right_content = str(right_doc.get("content", ""))
+    left_words = len(left_content.split())
+    right_words = len(right_content.split())
+    left_tokens = _fallback_token_set(left_content)
+    right_tokens = _fallback_token_set(right_content)
+    overlap = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+
+    added_points: list[str] = []
+    removed_points: list[str] = []
+    changed_points: list[str] = []
+    risk_notes: list[str] = []
+
+    if right_words > left_words:
+        added_points.append(f"Right document is longer by {right_words - left_words} words.")
+    if left_words > right_words:
+        removed_points.append(f"Right document is shorter by {left_words - right_words} words.")
+    if left_doc.get("chunk_count") != right_doc.get("chunk_count"):
+        changed_points.append(
+            f"Chunk count changed from {left_doc.get('chunk_count')} to {right_doc.get('chunk_count')}."
+        )
+    if left_doc.get("category_path") != right_doc.get("category_path"):
+        changed_points.append(
+            f"Category moved from {left_doc.get('category_path')} to {right_doc.get('category_path')}."
+        )
+    if _fallback_snippet(left_content) != _fallback_snippet(right_content):
+        changed_points.append(
+            f"Opening snippet changed: '{_fallback_snippet(left_content)}' -> '{_fallback_snippet(right_content)}'."
+        )
+
+    risk_notes.append(
+        "LLM semantic diff unavailable; this fallback reports structural deltas only."
+    )
+    risk_notes.append(f"Token overlap ratio: {overlap:.2f}")
+    risk_notes.append(f"LLM error: {str(err)[:300]}")
+
+    return {
+        "overview": "Deterministic fallback: semantic comparison degraded to structural signals.",
+        "added_points": added_points[:max_bullets],
+        "removed_points": removed_points[:max_bullets],
+        "changed_points": changed_points[:max_bullets],
+        "risk_notes": risk_notes[:max_bullets],
+        "fallback_error": str(err)[:500],
+        "degraded": True,
+    }
+
+
+async def semantic_diff_memory(
+    ctx: Context,
+    left_memory_id: str,
+    right_memory_id: str,
+    max_bullets: int = 12,
+) -> dict[str, Any]:
+    """
+    Compare two memory documents semantically and return concise added/removed/changed meaning deltas.
+    """
+    logger.info(
+        "Tool invoked: semantic_diff_memory (left_memory_id: %s, right_memory_id: %s, max_bullets: %s)",
+        left_memory_id,
+        right_memory_id,
+        max_bullets,
+    )
+
+    try:
+        UUID(left_memory_id)
+    except Exception:
+        return {"ok": False, "error": "left_memory_id must be a valid UUID"}
+    try:
+        UUID(right_memory_id)
+    except Exception:
+        return {"ok": False, "error": "right_memory_id must be a valid UUID"}
+
+    try:
+        parsed_max_bullets = int(max_bullets)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "max_bullets must be an integer"}
+    bullet_limit = max(1, min(parsed_max_bullets, 20))
+
+    left_doc = await fetch_document(ctx, left_memory_id)
+    if not left_doc.get("ok"):
+        return {"ok": False, "error": f"Left memory lookup failed: {left_doc.get('error', 'unknown error')}"}
+
+    right_doc = await fetch_document(ctx, right_memory_id)
+    if not right_doc.get("ok"):
+        return {"ok": False, "error": f"Right memory lookup failed: {right_doc.get('error', 'unknown error')}"}
+
+    try:
+        diff = await semantic_diff(left_doc["content"], right_doc["content"], bullet_limit)
+        return {
+            "ok": True,
+            "left_memory_id": left_memory_id,
+            "right_memory_id": right_memory_id,
+            "overview": diff.get("overview", ""),
+            "added_points": diff.get("added_points", []),
+            "removed_points": diff.get("removed_points", []),
+            "changed_points": diff.get("changed_points", []),
+            "risk_notes": diff.get("risk_notes", []),
+            "degraded": False,
+        }
+    except Exception as e:
+        logger.warning("semantic_diff_memory using deterministic fallback: %s", e)
+        fallback = _build_semantic_diff_fallback(left_doc, right_doc, e, bullet_limit)
+        return {
+            "ok": True,
+            "left_memory_id": left_memory_id,
+            "right_memory_id": right_memory_id,
+            **fallback,
+        }
 
 
 def _count_subtree_nodes(node: dict) -> int:

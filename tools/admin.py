@@ -1,6 +1,6 @@
 from fastmcp import FastMCP
 from .ingestion import memorize_context, check_ingestion_status
-from .search import search_memory, list_categories, explore_taxonomy, fetch_document
+from .search import search_memory, list_categories, explore_taxonomy, fetch_document, semantic_diff_memory
 from .context import initialize_context, trace_history, confirm_memory_validity, decision_timeline
 from .crud import update_memory, delete_memory, recategorize_memory, bulk_move_category, update_memory_metadata
 from .admin_tools import prune_history, export_memories, run_diagnostics, get_ingestion_stats, flush_staging, contradiction_audit
@@ -15,6 +15,7 @@ mcp.tool()(search_memory)
 mcp.tool()(list_categories)
 mcp.tool()(explore_taxonomy)
 mcp.tool()(fetch_document)
+mcp.tool()(semantic_diff_memory)
 mcp.tool()(trace_history)
 mcp.tool()(decision_timeline)
 mcp.tool()(confirm_memory_validity)

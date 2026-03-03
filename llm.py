@@ -24,6 +24,14 @@ class ConflictResolutionResult(TypedDict, total=False):
     changed_claims: list[str]
 
 
+class SemanticDiffResult(TypedDict):
+    overview: str
+    added_points: list[str]
+    removed_points: list[str]
+    changed_points: list[str]
+    risk_notes: list[str]
+
+
 async def embed(text: str) -> list[float]:
     logger.debug("Requesting embedding for text of length %d", len(text))
 
@@ -63,6 +71,39 @@ SEMANTIC_SECTIONS_SCHEMA = {
     "required": ["sections"],
     "additionalProperties": False,
 }
+
+
+SEMANTIC_DIFF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overview": {"type": "string"},
+        "added_points": {"type": "array", "items": {"type": "string"}},
+        "removed_points": {"type": "array", "items": {"type": "string"}},
+        "changed_points": {"type": "array", "items": {"type": "string"}},
+        "risk_notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "overview",
+        "added_points",
+        "removed_points",
+        "changed_points",
+        "risk_notes",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _normalize_bullets(values: Any, max_bullets: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    bullets: list[str] = []
+    for item in values:
+        text = str(item).replace("\n", " ").strip()
+        if text:
+            bullets.append(text[:280])
+        if len(bullets) >= max_bullets:
+            break
+    return bullets
 
 
 async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> list[dict[str, Any]]:
@@ -155,6 +196,69 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
                 "volatility_class": "low",
             }
         ]
+
+
+async def semantic_diff(left_text: str, right_text: str, max_bullets: int = 12) -> SemanticDiffResult:
+    """Compare two memory states and return semantic meaning changes."""
+    try:
+        parsed_max_bullets = int(max_bullets)
+    except (TypeError, ValueError):
+        parsed_max_bullets = 12
+    bullet_limit = max(1, min(parsed_max_bullets, 20))
+    safe_left = truncate_text(left_text, 9000)
+    safe_right = truncate_text(right_text, 9000)
+
+    async def _call():
+        completion = await openai_client.chat.completions.create(
+            model=EXTRACT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Compare LEFT and RIGHT as semantic states. Focus on meaning changes, not phrasing.\n"
+                        f"Return concise arrays with at most {bullet_limit} bullet strings per array.\n"
+                        "Definitions:\n"
+                        "- added_points: claims present in RIGHT but not in LEFT.\n"
+                        "- removed_points: claims present in LEFT but absent in RIGHT.\n"
+                        "- changed_points: claims that exist in both but materially changed values/meaning.\n"
+                        "- risk_notes: potential ambiguity, contradiction, or migration risk introduced by the change.\n"
+                        "Keep each bullet short and actionable. No markdown."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"<left>\n{safe_left}\n</left>\n\n<right>\n{safe_right}\n</right>",
+                },
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "semantic_diff",
+                    "schema": SEMANTIC_DIFF_SCHEMA,
+                    "strict": True,
+                },
+            },
+            reasoning_effort="low",
+            max_completion_tokens=3000,
+        )
+        return completion.choices[0].message.content
+
+    try:
+        raw = await _with_retries(_call, label=f"semantic_diff({EXTRACT_MODEL})")
+        parsed = _parse_json_safe(raw or "{}")
+        overview = str(parsed.get("overview", "")).strip()
+        if not overview:
+            overview = "Semantic changes detected between compared memory states."
+        return {
+            "overview": overview[:500],
+            "added_points": _normalize_bullets(parsed.get("added_points"), bullet_limit),
+            "removed_points": _normalize_bullets(parsed.get("removed_points"), bullet_limit),
+            "changed_points": _normalize_bullets(parsed.get("changed_points"), bullet_limit),
+            "risk_notes": _normalize_bullets(parsed.get("risk_notes"), bullet_limit),
+        }
+    except Exception:
+        logger.error("semantic_diff failed:\n%s", traceback.format_exc())
+        raise
 
 
 async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionResult:

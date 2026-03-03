@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-03-03
+
+### Added
+- New read-only MCP tool `semantic_diff_memory` (production and admin) for semantic comparison between two memory IDs, returning concise `overview`, `added_points`, `removed_points`, `changed_points`, and `risk_notes`.
+- Deterministic fallback mode for `semantic_diff_memory` when LLM calls fail, including structural change signals and a surfaced fallback error.
+- Input validation for `max_bullets` to return a clean error on invalid values instead of raising.
+- Tests for `semantic_diff_memory` invalid `max_bullets` input and left/right lookup failure branches.
+
 ## [1.2.0] - 2026-03-03
 
 ### Added
