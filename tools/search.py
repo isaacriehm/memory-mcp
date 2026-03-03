@@ -280,6 +280,52 @@ def _build_semantic_diff_fallback(
     }
 
 
+async def _resolve_latest_active_memory_id(memory_id: str) -> tuple[bool, str]:
+    """
+    Resolve any memory ID (active or superseded) to the latest active successor.
+    Returns (ok, resolved_id_or_error_message).
+    """
+    try:
+        target_id = UUID(memory_id)
+    except Exception:
+        return False, "memory_id must be a valid UUID"
+
+    try:
+        db_pool = get_pool()
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                WITH RECURSIVE chain AS (
+                    SELECT id, supersedes_id, archived_at, 0 AS depth
+                    FROM memories
+                    WHERE id = $1
+                  UNION ALL
+                    SELECT m.id, m.supersedes_id, m.archived_at, c.depth + 1
+                    FROM memories m
+                    JOIN chain c ON m.id = c.supersedes_id
+                    WHERE c.supersedes_id IS NOT NULL
+                      AND c.depth < 100
+                )
+                SELECT id, supersedes_id, archived_at, depth
+                FROM chain
+                ORDER BY depth DESC
+                LIMIT 1
+                """,
+                target_id,
+            )
+        if not row:
+            return False, f"Memory {memory_id} not found."
+        if row["archived_at"] is not None:
+            return False, f"Memory {memory_id} resolves to an archived record."
+        if row["supersedes_id"] is not None:
+            # Defensive guard for malformed chains.
+            return False, f"Memory {memory_id} could not resolve to an active record."
+        return True, str(row["id"])
+    except Exception as e:
+        logger.error("Error resolving latest active memory id for %s: %s\n%s", memory_id, e, traceback.format_exc())
+        return False, str(e)
+
+
 async def semantic_diff_memory(
     ctx: Context,
     left_memory_id: str,
@@ -311,11 +357,19 @@ async def semantic_diff_memory(
         return {"ok": False, "error": "max_bullets must be an integer"}
     bullet_limit = max(1, min(parsed_max_bullets, 20))
 
-    left_doc = await fetch_document(ctx, left_memory_id)
+    left_ok, resolved_left_id = await _resolve_latest_active_memory_id(left_memory_id)
+    if not left_ok:
+        return {"ok": False, "error": f"Left memory lookup failed: {resolved_left_id}"}
+
+    right_ok, resolved_right_id = await _resolve_latest_active_memory_id(right_memory_id)
+    if not right_ok:
+        return {"ok": False, "error": f"Right memory lookup failed: {resolved_right_id}"}
+
+    left_doc = await fetch_document(ctx, resolved_left_id)
     if not left_doc.get("ok"):
         return {"ok": False, "error": f"Left memory lookup failed: {left_doc.get('error', 'unknown error')}"}
 
-    right_doc = await fetch_document(ctx, right_memory_id)
+    right_doc = await fetch_document(ctx, resolved_right_id)
     if not right_doc.get("ok"):
         return {"ok": False, "error": f"Right memory lookup failed: {right_doc.get('error', 'unknown error')}"}
 
@@ -325,6 +379,8 @@ async def semantic_diff_memory(
             "ok": True,
             "left_memory_id": left_memory_id,
             "right_memory_id": right_memory_id,
+            "resolved_left_memory_id": resolved_left_id,
+            "resolved_right_memory_id": resolved_right_id,
             "overview": diff.get("overview", ""),
             "added_points": diff.get("added_points", []),
             "removed_points": diff.get("removed_points", []),
@@ -339,6 +395,8 @@ async def semantic_diff_memory(
             "ok": True,
             "left_memory_id": left_memory_id,
             "right_memory_id": right_memory_id,
+            "resolved_left_memory_id": resolved_left_id,
+            "resolved_right_memory_id": resolved_right_id,
             **fallback,
         }
 
