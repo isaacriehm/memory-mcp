@@ -222,6 +222,8 @@ FEEDBACK_RERANK_ENABLED=false
 
 Memories are organized into a dot-path hierarchy using PostgreSQL `ltree`. The system assigns paths automatically during ingestion. You can override with `recategorize_memory` or `bulk_move_category`.
 
+Project classifications under `projects.*` are derived dynamically from active taxonomy roots during ingestion. Known roots are preferred; if no known root fits and content strongly signals a new project slug, a new `projects.<slug>` root can be admitted automatically.
+
 **Example paths:**
 
 ```

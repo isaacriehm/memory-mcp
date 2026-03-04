@@ -301,7 +301,24 @@ async def process_and_insert_memory(
     if not active_taxonomy.strip():
         active_taxonomy = "profile\nprojects\norganizations\nconcepts\nreference\nhealth\nlifestyle\npsychology"
 
-    sections = await extract_semantic_sections(text, active_taxonomy)
+    project_rows = await conn.fetch(
+        """
+        SELECT DISTINCT subpath(category_path, 0, 2)::text AS project_root
+        FROM memories
+        WHERE supersedes_id IS NULL
+          AND archived_at IS NULL
+          AND category_path <@ 'projects'::ltree
+          AND nlevel(category_path) >= 2
+        ORDER BY project_root
+        """
+    )
+    known_project_roots = [row["project_root"] for row in project_rows if row["project_root"]]
+
+    sections = await extract_semantic_sections(
+        text,
+        active_taxonomy,
+        known_project_roots=known_project_roots,
+    )
     now = _now()
 
     base_metadata_input: Any = metadata or {}

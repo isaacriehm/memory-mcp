@@ -129,13 +129,197 @@ def _force_decisions_category(path: str) -> str:
     return f"projects.{project}.decisions"
 
 
-async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> list[dict[str, Any]]:
+def _normalize_project_root(path: str) -> str | None:
+    safe = sanitize_ltree_path(path or "")
+    parts = [p for p in safe.split(".") if p]
+    if len(parts) >= 2 and parts[0] == "projects":
+        return f"projects.{parts[1]}"
+    return None
+
+
+def _default_identifiers_for_root(root: str) -> list[str]:
+    root_norm = _normalize_project_root(root)
+    if not root_norm:
+        return []
+    slug = root_norm.split(".", 1)[1]
+    parts = [p for p in slug.replace("-", "_").split("_") if p]
+    candidates: list[str] = [slug, slug.replace("_", " "), slug.replace("_", "-")]
+    candidates.extend(parts)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for token in candidates:
+        normalized = token.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(token.strip())
+    return deduped
+
+
+def _identifiers_for_root(root: str) -> list[str]:
+    return _default_identifiers_for_root(root)
+
+
+def _has_strong_new_root_signal(content_lower: str, root: str) -> bool:
+    root_norm = _normalize_project_root(root)
+    if not root_norm:
+        return False
+
+    slug = root_norm.split(".", 1)[1]
+    slug_variants = [slug, slug.replace("_", " "), slug.replace("_", "-")]
+    for token in slug_variants:
+        token_norm = token.strip().lower()
+        # Strong exact slug signal (single or multi-word) is enough to admit.
+        if len(token_norm) >= 4 and token_norm in content_lower:
+            return True
+
+    parts = [p for p in slug.replace("-", "_").split("_") if len(p) >= 4]
+    part_matches = sum(1 for p in set(parts) if p.lower() in content_lower)
+    # If slug isn't mentioned directly, require at least two meaningful part matches.
+    return part_matches >= 2
+
+
+def _resolve_known_project_roots(known_project_roots: list[str] | None) -> list[str]:
+    resolved: set[str] = set()
+    for root in known_project_roots or []:
+        normalized = _normalize_project_root(root)
+        if normalized:
+            resolved.add(normalized)
+    return sorted(resolved)
+
+
+def _build_project_namespace_block(known_project_roots: list[str] | None) -> str:
+    roots = _resolve_known_project_roots(known_project_roots)
+    if not roots:
+        return ""
+
+    lines = [
+        "KNOWN PROJECT NAMESPACES (prefer these roots for project content):"
+    ]
+    for root in roots:
+        identifiers = _identifiers_for_root(root)
+        identifier_preview = ", ".join(identifiers[:5])
+        if identifier_preview:
+            lines.append(f"- {root} (root-derived identifiers: {identifier_preview})")
+        else:
+            lines.append(f"- {root}")
+    lines.append(
+        "Choose the correct project using subject matter and identifiers, not frequency bias from other projects. "
+        "If no known root is a good fit and the content clearly introduces a new project, create a new root "
+        "using `projects.<slug>`."
+    )
+    return "\n".join(lines)
+
+
+def _identifier_score(text_lower: str, identifiers: list[str]) -> int:
+    score = 0
+    for token in identifiers:
+        normalized = str(token).strip().lower()
+        if normalized and normalized in text_lower:
+            score += 1
+    return score
+
+
+def _best_project_root_for_content(
+    content: str,
+    candidate_roots: list[str],
+) -> tuple[str | None, int]:
+    text_lower = (content or "").lower()
+    best_root: str | None = None
+    best_score = 0
+    for root in candidate_roots:
+        identifiers = _identifiers_for_root(root)
+        score = _identifier_score(text_lower, identifiers)
+        if score > best_score:
+            best_root = root
+            best_score = score
+    return best_root, best_score
+
+
+def _rewrite_project_root(category_path: str, new_root: str) -> str:
+    safe = sanitize_ltree_path(category_path or "reference.unknown")
+    suffix = [part for part in safe.split(".") if part][2:]
+    rewritten = new_root
+    if suffix:
+        rewritten = f"{new_root}." + ".".join(suffix)
+    return sanitize_ltree_path(rewritten)
+
+
+def _validate_project_classification(
+    sections: list[dict[str, Any]],
+    known_project_roots: list[str] | None,
+) -> None:
+    allowed_roots = _resolve_known_project_roots(known_project_roots)
+    if not allowed_roots:
+        return
+
+    allowed_set = set(allowed_roots)
+
+    for section in sections:
+        original_path = section.get("category_path", "reference.unknown")
+        current_root = _normalize_project_root(original_path)
+        if not current_root:
+            continue
+
+        detected_root, detected_score = _best_project_root_for_content(
+            section.get("content", ""),
+            allowed_roots,
+        )
+        content_lower = str(section.get("content", "")).lower()
+        assigned_score = _identifier_score(
+            content_lower,
+            _identifiers_for_root(current_root),
+        )
+
+        if current_root not in allowed_set:
+            new_root_signal = _has_strong_new_root_signal(content_lower, current_root)
+            if new_root_signal and assigned_score >= max(1, detected_score):
+                section["category_path"] = sanitize_ltree_path(original_path)
+                logger.warning(
+                    "Admitted new project root '%s' for path '%s' based on strong slug evidence",
+                    current_root,
+                    original_path,
+                )
+                continue
+
+            if detected_root and detected_score > 0:
+                section["category_path"] = _rewrite_project_root(original_path, detected_root)
+                logger.warning(
+                    "Reclassified unknown project root '%s' -> '%s' for path '%s'",
+                    current_root,
+                    detected_root,
+                    original_path,
+                )
+            else:
+                section["category_path"] = "projects.general"
+                logger.warning(
+                    "Project root '%s' is not in known namespaces and no identifier match was found; "
+                    "falling back to projects.general",
+                    current_root,
+                )
+            continue
+
+        if detected_root and detected_root != current_root and detected_score > assigned_score:
+            section["category_path"] = _rewrite_project_root(original_path, detected_root)
+            logger.warning(
+                "Adjusted project root '%s' -> '%s' for path '%s' based on identifier match",
+                current_root,
+                detected_root,
+                original_path,
+            )
+
+
+async def extract_semantic_sections(
+    text: str,
+    active_taxonomy: str = "",
+    known_project_roots: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """
     LLM-driven semantic extraction. Ingests the complete payload in a single unbounded call.
     Divides input into cohesive logical units with taxonomy, tags, and volatility.
     """
     logger.debug("Extracting semantic sections from text of length %d", len(text))
 
+    project_namespace_block = _build_project_namespace_block(known_project_roots)
     system_content = (
         "Analyze the input data. Divide it into strictly cohesive logical units. "
         "Output the exact text for each unit into the 'content' field. "
@@ -169,6 +353,7 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
         "5. If content uses structured design-decision format (e.g., DECISION/RATIONALE/ALTERNATIVES/REJECTED), classify as `canonical` "
         "and choose a category ending in `.decisions` (typically `projects.<project>.decisions`). Never classify these as historical.\n\n"
         "CHUNKING RULES: Each section MUST be at least 3 sentences or 150 words. Do NOT split a single coherent topic into micro-chunks. Prefer fewer, larger sections over many small ones. A single document should rarely exceed 5 sections.\n\n"
+        f"{project_namespace_block}\n\n"
         f"EXISTING PATHS FOR REFERENCE:\n{active_taxonomy}"
     )
 
@@ -220,6 +405,8 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
             if _looks_like_decision_record(s.get("content", "")):
                 s["category_path"] = _force_decisions_category(s["category_path"])
                 s["suggested_tier"] = "canonical"
+
+        _validate_project_classification(sections, known_project_roots)
         
         sections = [s for s in sections if len(s.get("content", "").strip()) >= MIN_SECTION_LENGTH]
         logger.debug("Extracted %d semantic sections after length filtering", len(sections))
