@@ -10,6 +10,8 @@ T = TypeVar("T")
 
 from config import logger, OPENAI_MAX_RETRIES
 
+VALID_MEMORY_TIERS = {"canonical", "historical", "ephemeral"}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -81,3 +83,35 @@ def truncate_text(text: str, max_length: int = 12000) -> str:
         return text
     half = max_length // 2
     return text[:half] + "\n...[TRUNCATED]...\n" + text[-half:]
+
+
+def normalize_memory_tier(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    tier_norm = value.strip().lower()
+    return tier_norm if tier_norm in VALID_MEMORY_TIERS else None
+
+
+def infer_memory_tier(category_path: str, metadata: Optional[dict[str, Any]] = None) -> str:
+    metadata = metadata or {}
+    metadata_tier = normalize_memory_tier(metadata.get("tier") or metadata.get("memory_tier"))
+    if metadata_tier:
+        return metadata_tier
+
+    path_norm = (category_path or "").strip().lower()
+    if path_norm.startswith("context_store"):
+        return "ephemeral"
+
+    segments = [seg for seg in re.split(r"[.\-_]", path_norm) if seg]
+
+    historical_markers = {"history", "historical", "archive", "archives", "log", "logs", "changelog", "retrospective"}
+    if any(seg in historical_markers for seg in segments):
+        return "historical"
+
+    canonical_markers = {"decision", "decisions", "architecture", "strategy", "roadmap", "primer", "principles"}
+    root = path_norm.split(".", 1)[0] if path_norm else ""
+    if root in {"profile", "projects", "reference", "organizations", "concepts"}:
+        return "canonical"
+    if any(seg in canonical_markers for seg in segments):
+        return "canonical"
+    return "historical"

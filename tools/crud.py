@@ -9,7 +9,7 @@ from uuid import UUID
 from fastmcp import Context
 
 from config import logger
-from utils import _now, _vector_literal, sanitize_ltree_path
+from utils import _now, _vector_literal, sanitize_ltree_path, normalize_memory_tier
 from llm import embed
 from db import get_pool, _compute_verify_after
 
@@ -133,7 +133,7 @@ async def update_memory(ctx: Context, id: str, new_content: str) -> dict[str, An
 
 async def update_memory_metadata(ctx: Context, id: str, metadata: dict[str, Any]) -> dict[str, Any]:
     """Merge new key/value pairs into a memory's metadata without changing its content or category.
-    Use this to set ttl_days, add tags, or annotate existing memories.
+    Use this to set ttl_days, add tags, annotate existing memories, or explicitly override `tier`.
     Existing metadata keys not present in the update are preserved."""
     logger.info("Tool invoked: update_memory_metadata (id: %s)", id)
     try:
@@ -141,23 +141,41 @@ async def update_memory_metadata(ctx: Context, id: str, metadata: dict[str, Any]
     except Exception:
         return {"ok": False, "error": "id must be a valid UUID"}
 
+    if not isinstance(metadata, dict):
+        return {"ok": False, "error": "metadata must be an object"}
+
     ttl_days = metadata.get("ttl_days")
     if ttl_days is not None and (not isinstance(ttl_days, int) or ttl_days < 1):
         return {"ok": False, "error": "ttl_days must be a positive integer"}
+
+    tier_override = None
+    if "tier" in metadata:
+        tier_override = normalize_memory_tier(metadata.get("tier"))
+        if tier_override is None:
+            return {"ok": False, "error": "tier must be one of: canonical, historical, ephemeral"}
+
+    metadata_payload = dict(metadata)
+    if tier_override is not None:
+        metadata_payload["tier"] = tier_override
 
     try:
         db_pool = get_pool()
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "UPDATE memories SET metadata = metadata || $1::jsonb, updated_at = $2 "
+                "UPDATE memories SET metadata = metadata || $1::jsonb, tier = COALESCE($4::text, tier), updated_at = $2 "
                 "WHERE id = $3 AND supersedes_id IS NULL AND archived_at IS NULL "
-                "RETURNING id, metadata::text",
-                json.dumps(metadata), _now(), memory_id,
+                "RETURNING id, metadata::text, tier",
+                json.dumps(metadata_payload), _now(), memory_id, tier_override,
             )
         if not row:
             return {"ok": False, "error": f"Memory {id} not found, is superseded, or is archived."}
         logger.info("Successfully updated metadata for memory %s.", memory_id)
-        return {"ok": True, "id": str(memory_id), "metadata": json.loads(row["metadata"])}
+        return {
+            "ok": True,
+            "id": str(memory_id),
+            "metadata": json.loads(row["metadata"]),
+            "tier": row["tier"],
+        }
     except Exception as e:
         logger.error("Error in update_memory_metadata: %s\n%s", e, traceback.format_exc())
         return {"ok": False, "error": str(e)}

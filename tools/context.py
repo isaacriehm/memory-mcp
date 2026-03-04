@@ -805,12 +805,30 @@ async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
         )
         total_memories = sum(int(r["count"]) for r in cat_rows)
         taxonomy_tree = _build_taxonomy_tree(cat_rows, max_depth=2, max_branch_nodes=50)
+        decision_rows = await conn.fetch(
+            """
+            SELECT id, category_path::text AS category_path, content, updated_at
+            FROM memories
+            WHERE supersedes_id IS NULL
+              AND archived_at IS NULL
+              AND category_path::text LIKE '%.decisions'
+            ORDER BY updated_at DESC
+            LIMIT 10
+            """
+        )
+        decision_lines = [
+            f"- `{r['category_path']}` · `{str(r['id'])}` · {_shorten(r['content'], 160)}"
+            for r in decision_rows
+        ] or ["- none"]
 
         primer_content = (
             f"# System Primer\n\n"
             f"Knowledge base contains {total_memories} active memories "
             f"across {len(cat_rows)} categories.\n\n"
             f"## User Context\n{user_context}\n\n"
+            f"## Decision Provenance\n"
+            f"Active `*.decisions` records (most recent first):\n"
+            f"{chr(10).join(decision_lines)}\n\n"
             f"## Taxonomy\n"
             f"```\n{taxonomy_tree}\n```\n\n"
             f"## Verification Protocol\n"
@@ -849,6 +867,11 @@ async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
             f"3. After completion: `delete_context('handoff.<label>')` to clean up\n\n"
             f"**Note:** `initialize_context` automatically surfaces any active handoffs in `pending_handoffs` "
             f"so you never need to poll manually at session start.\n\n"
+            f"## Planner Obligation\n"
+            f"Any agent completing a planning or design session MUST call `memorize_context()` with a structured "
+            f"decision record before exiting. Use the format: DECISION / RATIONALE / ALTERNATIVES CONSIDERED / "
+            f"REJECTED BECAUSE. Assign category path `projects.<project>.decisions`. Do not rely on handoff packs "
+            f"for design rationale — handoff packs expire, decision records do not.\n\n"
             f"## Retrieval Guide\n"
             f"- `search_memory(query)` — hybrid semantic + keyword search, returns top 10\n"
             f"- `search_memory(query, category_path='projects.myapp.planning')` — scoped to subtree\n"
@@ -887,8 +910,8 @@ async def synthesize_system_primer(conn, profile_changed: bool = False) -> None:
 
             await conn.execute(
                 """
-                INSERT INTO memories (id, content, embedding, category_path, metadata, created_at, updated_at, last_accessed_at)
-                VALUES ($1, $2, $3::vector, 'reference.system.primer'::ltree, '{}'::jsonb, $4, $4, $4)
+                INSERT INTO memories (id, content, embedding, category_path, metadata, created_at, updated_at, last_accessed_at, tier)
+                VALUES ($1, $2, $3::vector, 'reference.system.primer'::ltree, '{}'::jsonb, $4, $4, $4, 'canonical')
                 ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, updated_at = EXCLUDED.updated_at
                 """,
                 primer_id, primer_content, vec_lit, now,

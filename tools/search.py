@@ -18,8 +18,17 @@ from config import (
     CANONICAL_MIN_IN_TOPK,
     HISTORICAL_MIN_IN_TOPK,
     FEEDBACK_EXPLORATION_SLOTS,
+    HISTORICAL_BASE_SCORE_MULTIPLIER,
 )
-from utils import _now, _vector_literal, _add_ttl_warning, sanitize_ltree_path, sanitize_ltree_label
+from utils import (
+    _now,
+    _vector_literal,
+    _add_ttl_warning,
+    sanitize_ltree_path,
+    sanitize_ltree_label,
+    infer_memory_tier,
+    normalize_memory_tier,
+)
 from llm import embed, semantic_diff
 from db import get_pool
 
@@ -53,29 +62,14 @@ def _normalize_outcome(outcome: Any) -> tuple[bool, int | str]:
 
 
 def _infer_memory_tier(category_path: str, metadata: dict[str, Any]) -> str:
-    tier_raw = metadata.get("tier") or metadata.get("memory_tier")
-    if isinstance(tier_raw, str):
-        tier_norm = tier_raw.strip().lower()
-        if tier_norm in {"canonical", "historical", "ephemeral"}:
-            return tier_norm
+    return infer_memory_tier(category_path, metadata)
 
-    path_norm = (category_path or "").strip().lower()
-    if path_norm.startswith("context_store"):
-        return "ephemeral"
 
-    segments = [seg for seg in re.split(r"[.\-_]", path_norm) if seg]
-
-    historical_markers = {"history", "historical", "archive", "archives", "log", "logs", "changelog", "retrospective"}
-    if any(seg in historical_markers for seg in segments):
+def _resolve_result_tier(category_path: str, metadata: dict[str, Any], tier_column: Any) -> str:
+    resolved = normalize_memory_tier(tier_column) or _infer_memory_tier(category_path, metadata)
+    if resolved == "ephemeral":
         return "historical"
-
-    canonical_markers = {"decision", "decisions", "architecture", "strategy", "roadmap", "primer", "principles"}
-    root = path_norm.split(".", 1)[0] if path_norm else ""
-    if root in {"profile", "projects", "reference", "organizations", "concepts"}:
-        return "canonical"
-    if any(seg in canonical_markers for seg in segments):
-        return "canonical"
-    return "other"
+    return resolved
 
 
 def _effective_tier_requirements(candidates: list[dict[str, Any]], limit: int) -> dict[str, int]:
@@ -318,7 +312,7 @@ async def search_memory(
                     ORDER BY keyword_score DESC LIMIT $2
                 ),
                 combined AS (
-                    SELECT m.id, m.content, m.category_path::text, m.supersedes_id, m.created_at, m.updated_at, m.metadata::text,
+                    SELECT m.id, m.content, m.category_path::text, m.supersedes_id, m.created_at, m.updated_at, m.metadata::text, m.tier,
                     COALESCE(s.semantic_score, 0.0) AS semantic_score,
                     COALESCE(k.keyword_score, 0.0) AS keyword_score,
                     COALESCE(1.0 / (60 + s.semantic_rank), 0.0) + COALESCE(1.0 / (60 + k.keyword_rank), 0.0) AS rrf_score
@@ -360,7 +354,13 @@ async def search_memory(
             candidates: list[dict[str, Any]] = []
             for r in rows:
                 metadata = json.loads(r["metadata"]) if r["metadata"] else {}
-                base_score = float(r["rrf_score"])
+                tier = _resolve_result_tier(r["category_path"], metadata, r["tier"])
+                raw_base_score = float(r["rrf_score"])
+                base_score = (
+                    raw_base_score * HISTORICAL_BASE_SCORE_MULTIPLIER
+                    if tier == "historical"
+                    else raw_base_score
+                )
                 candidate = {
                     "id": r["id"],
                     "content": r["content"],
@@ -370,9 +370,10 @@ async def search_memory(
                     "created_at": r["created_at"],
                     "updated_at": r["updated_at"],
                     "metadata": metadata,
-                    "tier": _infer_memory_tier(r["category_path"], metadata),
+                    "tier": tier,
                     "semantic_score": float(r["semantic_score"]),
                     "keyword_score": float(r["keyword_score"]),
+                    "raw_base_score": raw_base_score,
                     "base_score": base_score,
                     "adjusted_score": base_score,
                     "feedback_signal": 0.0,
@@ -490,6 +491,7 @@ async def search_memory(
                 }
                 if FEEDBACK_RERANK_ENABLED:
                     result_item["base_score"] = round(float(item["base_score"]), 6)
+                    result_item["raw_base_score"] = round(float(item["raw_base_score"]), 6)
                     result_item["feedback_delta"] = round(float(item["feedback_delta"]), 6)
                     result_item["feedback_signal"] = round(float(item["feedback_signal"]), 6)
                     result_item["tier"] = item["tier"]

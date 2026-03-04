@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-03-03
+
+### Added
+- New persisted `memories.tier` column (`canonical`/`historical`/`ephemeral`) with partial index `memories_tier_idx`.
+- New migration script `scripts/migrate_add_tier_column.py` to add/backfill tier values for existing memories and report tier distribution.
+- New ingestion-time config `TIER_LLM_INFERENCE_ENABLED` (default `true`) to gate LLM tier suggestions without disabling ingestion.
+- New retrieval-time config `HISTORICAL_BASE_SCORE_MULTIPLIER` (default `0.85`) to apply a tunable historical base-score penalty.
+- `extract_semantic_sections` now returns `suggested_tier` and includes decision-record classification guidance.
+
+### Changed
+- Ingestion now resolves and writes tier on insert with precedence: explicit metadata tier override, LLM `suggested_tier`, then heuristic fallback.
+- `memorize_context` ingestion queue now preserves optional caller metadata so explicit `metadata.tier` overrides reach insert-time tier resolution.
+- `search_memory` now applies historical-tier penalty before feedback rerank and surfaces `raw_base_score` diagnostics when rerank diagnostics are enabled.
+- `update_memory_metadata` now validates and writes `tier` directly to the authoritative column, enabling explicit promote/demote workflows.
+- Decision-record extraction now enforces canonical classification and normalizes category to `projects.<project>.decisions`.
+- System primer synthesis now surfaces active `*.decisions` records and includes a mandatory planner decision-memorization protocol.
+
 ## [1.5.0] - 2026-03-03
 
 ### Added

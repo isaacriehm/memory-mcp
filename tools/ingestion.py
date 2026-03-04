@@ -1,5 +1,6 @@
 """Fire-and-forget ingestion tools."""
 
+import json
 import traceback
 from typing import Optional, Any
 from uuid import UUID
@@ -10,11 +11,17 @@ from config import logger, MAX_MEMORIZE_TEXT_LENGTH
 from db import get_pool
 
 
-async def memorize_context(ctx: Context, text: str, ttl_days: Optional[int] = None) -> dict[str, Any]:
+async def memorize_context(
+    ctx: Context,
+    text: str,
+    ttl_days: Optional[int] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """
     Enqueue text for autonomous ingestion. Returns a job_id immediately.
     The system will chunk, categorize, deduplicate, and merge the content
-    in the background. Use check_ingestion_status(job_id) to poll progress.
+    in the background. Optional `metadata` can carry ingestion hints (for example `tier` override).
+    Use check_ingestion_status(job_id) to poll progress.
     """
     logger.info("Tool invoked: memorize_context (text length: %d)", len(text) if text else 0)
     if not text or not isinstance(text, str) or not text.strip():
@@ -26,16 +33,21 @@ async def memorize_context(ctx: Context, text: str, ttl_days: Optional[int] = No
     if ttl_days is not None and (not isinstance(ttl_days, int) or ttl_days < 1):
         return {"ok": False, "error": "ttl_days must be a positive integer"}
 
+    if metadata is not None and not isinstance(metadata, dict):
+        return {"ok": False, "error": "metadata must be an object"}
+
+    metadata_payload = dict(metadata or {})
+
     try:
         db_pool = get_pool()
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO ingestion_staging (raw_text, ttl_days)
-                VALUES ($1, $2)
+                INSERT INTO ingestion_staging (raw_text, ttl_days, metadata)
+                VALUES ($1, $2, $3::jsonb)
                 RETURNING job_id
                 """,
-                text, ttl_days,
+                text, ttl_days, json.dumps(metadata_payload),
             )
         job_id = str(row["job_id"])
         logger.info("memorize_context enqueued job %s", job_id)

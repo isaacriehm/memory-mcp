@@ -164,7 +164,7 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | Tool | Description |
 |---|---|
 | `initialize_context` | **Call first every session.** Returns the System Primer + verification prompts for aging memories. |
-| `memorize_context` | Ingest raw text. Automatically chunks, embeds, categorizes, and deduplicates. Supports `ttl_days`. |
+| `memorize_context` | Ingest raw text. Automatically chunks, embeds, categorizes, and deduplicates. Supports `ttl_days` and optional `metadata` hints (including `tier` override). |
 | `check_ingestion_status` | Poll async ingestion job by `job_id`. Returns `pending`, `processing`, `complete`, or `failed`. |
 | `search_memory` | Hybrid vector + BM25 search with Reciprocal Rank Fusion. Supports optional, bounded feedback rerank behind a kill switch. Filter by `category_path`; optional `task_type` scopes feedback influence. |
 | `report_retrieval_outcome` | Record retrieval feedback (`+1` helpful, `-1` not helpful) for a query-memory pair. Superseded IDs auto-resolve to the latest active memory. Optional `category_path`/`task_type` scope feedback influence. |
@@ -207,6 +207,7 @@ Feedback reranking is intentionally guarded:
 - Base retrieval (semantic + keyword + RRF) always stays primary.
 - Feedback is a bounded secondary adjustment (`FEEDBACK_MAX_DELTA`, default `0.05`).
 - Tier floors can protect diversity in top-K (`CANONICAL_MIN_IN_TOPK`, `HISTORICAL_MIN_IN_TOPK`).
+- Historical memories receive a mild base-score multiplier before rerank (`HISTORICAL_BASE_SCORE_MULTIPLIER`, default `0.85`).
 - Collection can stay on while rerank is off.
 
 Rollback is immediate:
@@ -224,8 +225,8 @@ Memories are organized into a dot-path hierarchy using PostgreSQL `ltree`. The s
 **Example paths:**
 
 ```
-user.profile.personal
-user.health.medical
+profile.identity.core
+profile.health.medical
 projects.myapp.architecture
 projects.myapp.decisions
 organizations.acme.business
@@ -292,6 +293,13 @@ Copy `.env.example` to `.env` and fill in your values.
 | `CANONICAL_MIN_IN_TOPK` | `2` | Minimum canonical memories kept in top-K when available. |
 | `HISTORICAL_MIN_IN_TOPK` | `1` | Minimum historical memories kept in top-K when available. |
 | `FEEDBACK_EXPLORATION_SLOTS` | `0` | Optional number of top-K slots reserved for underexplored candidates. |
+| `HISTORICAL_BASE_SCORE_MULTIPLIER` | `0.85` | Multiplier applied to historical-tier base retrieval score before feedback rerank. |
+
+### Optional — Tier Inference
+
+| Variable | Default | Description |
+|---|---|---|
+| `TIER_LLM_INFERENCE_ENABLED` | `true` | Enables LLM-suggested memory tier at ingestion (explicit/manual tier still wins). |
 
 ### Optional — OpenAI & Concurrency
 

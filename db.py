@@ -8,9 +8,16 @@ from datetime import datetime, timedelta
 
 from config import (
     logger, DATABASE_URL, PG_POOL_MIN, PG_POOL_MAX, EMBED_DIM, MAX_CONCURRENT_API_CALLS,
-    DUP_THRESHOLD, CONFLICT_THRESHOLD, RELATES_TO_THRESHOLD, MAX_TAXONOMY_PATHS
+    DUP_THRESHOLD, CONFLICT_THRESHOLD, RELATES_TO_THRESHOLD, MAX_TAXONOMY_PATHS,
+    TIER_LLM_INFERENCE_ENABLED,
 )
-from utils import _now, generate_deterministic_id, _vector_literal
+from utils import (
+    _now,
+    generate_deterministic_id,
+    _vector_literal,
+    infer_memory_tier,
+    normalize_memory_tier,
+)
 from llm import embed, extract_semantic_sections, evaluate_conflict
 
 pool: asyncpg.Pool | None = None
@@ -69,6 +76,7 @@ async def init_db(conn: asyncpg.Connection) -> None:
             category_path ltree NOT NULL DEFAULT 'reference.unknown'::ltree,
             supersedes_id UUID,
             archived_at TIMESTAMPTZ,
+            tier TEXT CHECK (tier IN ('canonical', 'historical', 'ephemeral')),
             metadata JSONB DEFAULT '{{}}'::jsonb,
             lexical_search tsvector,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -83,6 +91,23 @@ async def init_db(conn: asyncpg.Connection) -> None:
     await conn.execute("UPDATE memories SET lexical_search = to_tsvector('english', content) WHERE lexical_search IS NULL;")
     await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;")
     await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS verify_after TIMESTAMPTZ;")
+    await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS tier TEXT;")
+    await conn.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'memories_tier_check'
+                  AND conrelid = 'memories'::regclass
+            ) THEN
+                ALTER TABLE memories
+                ADD CONSTRAINT memories_tier_check
+                CHECK (tier IN ('canonical', 'historical', 'ephemeral') OR tier IS NULL);
+            END IF;
+        END $$;
+        """
+    )
 
     await conn.execute(
         """
@@ -102,12 +127,14 @@ async def init_db(conn: asyncpg.Connection) -> None:
             job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             raw_text TEXT NOT NULL,
             ttl_days INT,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             status VARCHAR(20) NOT NULL DEFAULT 'pending',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             error TEXT
         );
         """
     )
+    await conn.execute("ALTER TABLE ingestion_staging ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;")
 
     await conn.execute(
         """
@@ -140,6 +167,10 @@ async def init_db(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS memories_verify_after_idx "
         "ON memories (verify_after) WHERE verify_after IS NOT NULL;"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS memories_tier_idx "
+        "ON memories (tier) WHERE tier IS NOT NULL;"
     )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS conflict_audit_events_created_at_idx "
@@ -249,6 +280,7 @@ async def process_and_insert_memory(
     text: str,
     conn: asyncpg.Connection,
     ttl_days: Optional[int] = None,
+    metadata: Optional[dict[str, Any]] = None,
     dup_threshold: float = 0.95,
     conflict_threshold: float = 0.85,
 ) -> UUID:
@@ -272,7 +304,13 @@ async def process_and_insert_memory(
     sections = await extract_semantic_sections(text, active_taxonomy)
     now = _now()
 
-    base_metadata: dict[str, Any] = {}
+    base_metadata_input: Any = metadata or {}
+    if isinstance(base_metadata_input, str):
+        try:
+            base_metadata_input = json.loads(base_metadata_input)
+        except Exception:
+            base_metadata_input = {}
+    base_metadata: dict[str, Any] = dict(base_metadata_input) if isinstance(base_metadata_input, dict) else {}
     if ttl_days is not None:
         base_metadata["ttl_days"] = ttl_days
 
@@ -287,6 +325,13 @@ async def process_and_insert_memory(
         chunk_volatility = section.get("volatility_class", "low")
         chunk_verify_after = _compute_verify_after(chunk_volatility, now)
         chunk_content = section.get("content", "")
+        chunk_suggested_tier_raw = (
+            normalize_memory_tier(section.get("suggested_tier"))
+            if TIER_LLM_INFERENCE_ENABLED
+            else None
+        )
+        # Ephemeral suggestions from ingestion are treated as non-authoritative hints.
+        chunk_suggested_tier = None if chunk_suggested_tier_raw == "ephemeral" else chunk_suggested_tier_raw
 
         # Content-based IDs: isolate from LLM non-determinism (index shifts across re-ingestions).
         chunk_id = generate_deterministic_id(chunk_content)
@@ -332,6 +377,13 @@ async def process_and_insert_memory(
             if chunk_tags:
                 chunk_metadata["tags"] = chunk_tags
             chunk_metadata["volatility_class"] = chunk_volatility
+            if chunk_suggested_tier_raw:
+                chunk_metadata["suggested_tier"] = chunk_suggested_tier_raw
+
+            explicit_tier = normalize_memory_tier(chunk_metadata.get("tier"))
+            resolved_tier = explicit_tier or chunk_suggested_tier or infer_memory_tier(chunk_path, chunk_metadata)
+            if resolved_tier not in {"canonical", "historical", "ephemeral"}:
+                resolved_tier = "historical"
 
             audit_details: dict[str, Any] = {}
             reason_summary = resolution_result.get("reason_summary")
@@ -348,6 +400,7 @@ async def process_and_insert_memory(
             return {
                 "id": insert_id, "chunk": final_text, "vec": final_vec,
                 "cat_path": chunk_path, "metadata": chunk_metadata,
+                "tier": resolved_tier,
                 "exists": False,
                 "supersedes": similar_mem["id"],
                 "resolution": resolution,
@@ -360,9 +413,17 @@ async def process_and_insert_memory(
             if chunk_tags:
                 chunk_metadata["tags"] = chunk_tags
             chunk_metadata["volatility_class"] = chunk_volatility
+            if chunk_suggested_tier_raw:
+                chunk_metadata["suggested_tier"] = chunk_suggested_tier_raw
+
+            explicit_tier = normalize_memory_tier(chunk_metadata.get("tier"))
+            resolved_tier = explicit_tier or chunk_suggested_tier or infer_memory_tier(chunk_path, chunk_metadata)
+            if resolved_tier not in {"canonical", "historical", "ephemeral"}:
+                resolved_tier = "historical"
             return {
                 "id": chunk_id, "chunk": chunk_content, "vec": vec,
                 "cat_path": chunk_path, "metadata": chunk_metadata,
+                "tier": resolved_tier,
                 "exists": False, "supersedes": None, "resolution": None,
                 "verify_after": chunk_verify_after,
             }
@@ -392,11 +453,18 @@ async def process_and_insert_memory(
                     vec_lit = _vector_literal(item["vec"])
                     await conn.execute(
                         """
-                        INSERT INTO memories (id, content, embedding, category_path, metadata, lexical_search, created_at, updated_at, last_accessed_at, verify_after)
-                        VALUES ($1, $2, $3::vector, $4::ltree, $5::jsonb, to_tsvector('english', $2), $6, $6, $6, $7)
+                        INSERT INTO memories (id, content, embedding, category_path, metadata, lexical_search, created_at, updated_at, last_accessed_at, verify_after, tier)
+                        VALUES ($1, $2, $3::vector, $4::ltree, $5::jsonb, to_tsvector('english', $2), $6, $6, $6, $7, $8)
                         ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at
                         """,
-                        insert_id, item["chunk"], vec_lit, item["cat_path"], json.dumps(item["metadata"]), now, item.get("verify_after"),
+                        insert_id,
+                        item["chunk"],
+                        vec_lit,
+                        item["cat_path"],
+                        json.dumps(item["metadata"]),
+                        now,
+                        item.get("verify_after"),
+                        item.get("tier"),
                     )
 
                     # Set supersedes_id on the OLD node pointing to the new replacement.

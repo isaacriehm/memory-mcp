@@ -52,7 +52,7 @@ async def _ingestion_worker() -> None:
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
                     )
-                    RETURNING job_id, raw_text, ttl_days
+                    RETURNING job_id, raw_text, ttl_days, metadata
                     """
                 )
 
@@ -66,7 +66,10 @@ async def _ingestion_worker() -> None:
             try:
                 async with p.acquire() as proc_conn:
                     await db.process_and_insert_memory(
-                        job["raw_text"], proc_conn, job["ttl_days"]
+                        job["raw_text"],
+                        proc_conn,
+                        job["ttl_days"],
+                        metadata=job["metadata"] or {},
                     )
 
                 async with p.acquire() as status_conn:

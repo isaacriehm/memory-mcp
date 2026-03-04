@@ -62,8 +62,12 @@ SEMANTIC_SECTIONS_SCHEMA = {
                         "type": "string",
                         "enum": ["static", "high", "medium", "low"],
                     },
+                    "suggested_tier": {
+                        "type": "string",
+                        "enum": ["canonical", "historical", "ephemeral"],
+                    },
                 },
-                "required": ["category_path", "content", "tags", "volatility_class"],
+                "required": ["category_path", "content", "tags", "volatility_class", "suggested_tier"],
                 "additionalProperties": False,
             },
         },
@@ -106,6 +110,25 @@ def _normalize_bullets(values: Any, max_bullets: int) -> list[str]:
     return bullets
 
 
+def _looks_like_decision_record(content: str) -> bool:
+    text = (content or "").lower()
+    has_decision = "decision" in text
+    has_rationale = "rationale" in text
+    has_alternatives = "alternatives considered" in text or "alternatives" in text
+    has_rejected = "rejected because" in text or "rejected" in text
+    return has_decision and has_rationale and (has_alternatives or has_rejected)
+
+
+def _force_decisions_category(path: str) -> str:
+    safe = sanitize_ltree_path(path or "projects.general.decisions")
+    parts = [p for p in safe.split(".") if p]
+    if len(parts) >= 2 and parts[0] == "projects":
+        project = parts[1]
+    else:
+        project = "general"
+    return f"projects.{project}.decisions"
+
+
 async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> list[dict[str, Any]]:
     """
     LLM-driven semantic extraction. Ingests the complete payload in a single unbounded call.
@@ -138,6 +161,13 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
         "   - NEVER mix professional tech/sales content into 'profile.health' or 'profile.lifestyle'.\n\n"
         "4. NOTATION: Strict dot-notation. Preferred depth: 2-4 levels. Avoid hyper-specific file paths or endpoint names. "
         "Never use 'personal' as an L2 under 'profile' (e.g. use profile.identity, not profile.personal.identity).\n\n"
+        "TIER CLASSIFICATION RULES:\n"
+        "1. `canonical`: strategic decisions, architecture commitments, durable product direction, business context, principles.\n"
+        "2. `historical`: implementation notes, migrations, refactor context, superseded operational details.\n"
+        "3. `ephemeral`: temporary session/task state. This should NOT be ingested as memory.\n"
+        "4. For ingestion payloads, do NOT assign `ephemeral`; use canonical or historical.\n"
+        "5. If content uses structured design-decision format (e.g., DECISION/RATIONALE/ALTERNATIVES/REJECTED), classify as `canonical` "
+        "and choose a category ending in `.decisions` (typically `projects.<project>.decisions`). Never classify these as historical.\n\n"
         "CHUNKING RULES: Each section MUST be at least 3 sentences or 150 words. Do NOT split a single coherent topic into micro-chunks. Prefer fewer, larger sections over many small ones. A single document should rarely exceed 5 sections.\n\n"
         f"EXISTING PATHS FOR REFERENCE:\n{active_taxonomy}"
     )
@@ -173,6 +203,7 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
                     "content": text,
                     "tags": [],
                     "volatility_class": "low",
+                    "suggested_tier": "canonical",
                 }
             ]
         for s in sections:
@@ -182,6 +213,13 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
             s["volatility_class"] = s.get("volatility_class", "low")
             if s["volatility_class"] not in ("static", "high", "medium", "low"):
                 s["volatility_class"] = "low"
+            suggested_tier = str(s.get("suggested_tier", "canonical")).strip().lower()
+            if suggested_tier not in ("canonical", "historical", "ephemeral"):
+                suggested_tier = "canonical"
+            s["suggested_tier"] = suggested_tier
+            if _looks_like_decision_record(s.get("content", "")):
+                s["category_path"] = _force_decisions_category(s["category_path"])
+                s["suggested_tier"] = "canonical"
         
         sections = [s for s in sections if len(s.get("content", "").strip()) >= MIN_SECTION_LENGTH]
         logger.debug("Extracted %d semantic sections after length filtering", len(sections))
@@ -194,6 +232,7 @@ async def extract_semantic_sections(text: str, active_taxonomy: str = "") -> lis
                 "content": text,
                 "tags": [],
                 "volatility_class": "low",
+                "suggested_tier": "canonical",
             }
         ]
 
