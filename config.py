@@ -51,6 +51,8 @@ ADMIN_PORT = int(os.getenv("ADMIN_PORT", "8767"))
 STAGING_RETENTION_DAYS = int(os.getenv("STAGING_RETENTION_DAYS", "7"))
 
 API_KEY = os.getenv("API_KEY")  # Optional; enables Bearer token auth when set
+OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "api-key")
+OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", API_KEY)
 
 MAX_MEMORIZE_TEXT_LENGTH = int(os.getenv("MAX_MEMORIZE_TEXT_LENGTH", "500000"))
 

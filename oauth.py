@@ -53,9 +53,16 @@ class MinimalOAuthBridge:
     then returns `API_KEY` as the bearer access token.
     """
 
-    def __init__(self, api_key: str, client_id: str = "api-key", code_ttl_s: int = 300):
+    def __init__(
+        self,
+        api_key: str,
+        client_id: str = "api-key",
+        client_secret: str | None = None,
+        code_ttl_s: int = 300,
+    ):
         self.api_key = api_key
         self.client_id = client_id
+        self.client_secret = client_secret
         self.code_ttl_s = code_ttl_s
         self._codes: dict[str, AuthCode] = {}
 
@@ -67,6 +74,10 @@ class MinimalOAuthBridge:
         forced = os.getenv("OAUTH_ISSUER")
         if forced:
             return forced.rstrip("/")
+        xf_proto = request.headers.get("x-forwarded-proto")
+        xf_host = request.headers.get("x-forwarded-host")
+        if xf_proto and xf_host:
+            return f"{xf_proto}://{xf_host}".rstrip("/")
         return str(request.base_url).rstrip("/")
 
     async def authorize(self, request: Request):
@@ -109,7 +120,9 @@ class MinimalOAuthBridge:
         code_verifier = form.get("code_verifier", "")
 
         client_id, client_secret = _client_creds(request, form)
-        if client_id != self.client_id or client_secret != self.api_key:
+        if client_id != self.client_id:
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+        if self.client_secret is not None and client_secret != self.client_secret:
             return JSONResponse({"error": "invalid_client"}, status_code=401)
         if grant_type != "authorization_code":
             return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
@@ -162,8 +175,13 @@ class MinimalOAuthBridge:
         )
 
 
-def register_oauth_routes(mcp, api_key: str, client_id: str = "api-key") -> None:
-    oauth = MinimalOAuthBridge(api_key=api_key, client_id=client_id)
+def register_oauth_routes(
+    mcp,
+    api_key: str,
+    client_id: str = "api-key",
+    client_secret: str | None = None,
+) -> None:
+    oauth = MinimalOAuthBridge(api_key=api_key, client_id=client_id, client_secret=client_secret)
 
     @mcp.custom_route("/authorize", methods=["GET"])
     async def oauth_authorize(request: Request):

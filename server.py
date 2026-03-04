@@ -2,7 +2,18 @@ import asyncio
 import traceback
 import asyncpg
 
-from config import logger, DATABASE_URL, PG_POOL_MIN, PG_POOL_MAX, STAGING_RETENTION_DAYS, PRODUCTION_PORT, ADMIN_PORT, API_KEY
+from config import (
+    logger,
+    DATABASE_URL,
+    PG_POOL_MIN,
+    PG_POOL_MAX,
+    STAGING_RETENTION_DAYS,
+    PRODUCTION_PORT,
+    ADMIN_PORT,
+    API_KEY,
+    OAUTH_CLIENT_ID,
+    OAUTH_CLIENT_SECRET,
+)
 from utils import _now
 import db
 from db import init_db
@@ -201,8 +212,13 @@ async def server_lifespan(server):
 if __name__ == "__main__":
     logger.info("Starting memory-mcp dual FastMCP servers")
     if API_KEY:
-        register_oauth_routes(production_mcp, api_key=API_KEY, client_id="api-key")
-        logger.info("Minimal OAuth bridge enabled for connector compatibility (client_id=api-key).")
+        register_oauth_routes(
+            production_mcp,
+            api_key=API_KEY,
+            client_id=OAUTH_CLIENT_ID,
+            client_secret=OAUTH_CLIENT_SECRET,
+        )
+        logger.info("Minimal OAuth bridge enabled for connector compatibility (client_id=%s).", OAUTH_CLIENT_ID)
     
     @asynccontextmanager
     async def dummy_lifespan(server):

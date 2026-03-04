@@ -324,6 +324,8 @@ Copy `.env.example` to `.env` and fill in your values.
 | Variable | Default | Description |
 |---|---|---|
 | `API_KEY` | _(unset)_ | Static Bearer token for the production server. Also used as OAuth client secret in the minimal connector bridge. |
+| `OAUTH_CLIENT_ID` | `api-key` | OAuth bridge client id expected from connector OAuth settings. |
+| `OAUTH_CLIENT_SECRET` | `API_KEY` | OAuth bridge client secret expected at `/token` (Basic or POST body). |
 | `OAUTH_ALLOWED_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback` | Optional comma-separated allowlist for OAuth bridge redirect URIs. |
 | `OAUTH_ISSUER` | _(auto from request URL)_ | Optional explicit issuer URL when behind reverse proxies/CDNs. |
 
@@ -395,9 +397,9 @@ For Claude connector compatibility, the server also exposes minimal OAuth routes
 
 Bridge behavior is intentionally minimal:
 
-1. OAuth `client_id` is fixed to `api-key`.
-2. OAuth `client_secret` must equal `API_KEY`.
-3. Successful token exchange returns bearer token `API_KEY`.
+1. OAuth `client_id` must match `OAUTH_CLIENT_ID` (default `api-key`).
+2. OAuth `client_secret` must match `OAUTH_CLIENT_SECRET` (defaults to `API_KEY`).
+3. Successful token exchange returns bearer token `API_KEY` for MCP calls.
 
 This keeps API-key auth as the only credential while satisfying connector OAuth route expectations.
 
