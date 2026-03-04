@@ -9,6 +9,7 @@ from db import init_db
 from tools.production import mcp as production_mcp
 from tools.admin import mcp as admin_mcp
 from tools.context import synthesize_system_primer
+from oauth import register_oauth_routes
 
 from contextlib import asynccontextmanager
 from starlette.middleware import Middleware
@@ -199,6 +200,9 @@ async def server_lifespan(server):
 
 if __name__ == "__main__":
     logger.info("Starting memory-mcp dual FastMCP servers")
+    if API_KEY:
+        register_oauth_routes(production_mcp, api_key=API_KEY, client_id="api-key")
+        logger.info("Minimal OAuth bridge enabled for connector compatibility (client_id=api-key).")
     
     @asynccontextmanager
     async def dummy_lifespan(server):
@@ -210,7 +214,21 @@ if __name__ == "__main__":
         
         prod_middleware = None
         if API_KEY:
-            prod_middleware = [Middleware(BearerTokenMiddleware, api_key=API_KEY)]
+            prod_middleware = [
+                Middleware(
+                    BearerTokenMiddleware,
+                    api_key=API_KEY,
+                    exempt_paths={
+                        "/authorize",
+                        "/token",
+                        "/.well-known/oauth-authorization-server",
+                        "/mcp/.well-known/oauth-authorization-server",
+                        "/.well-known/oauth-protected-resource",
+                        "/mcp/.well-known/oauth-protected-resource",
+                        "/.well-known/oauth-protected-resource/mcp",
+                    },
+                )
+            ]
             logger.info("Bearer token auth enabled on production server.")
         else:
             logger.info("No API_KEY set — production server running without auth (WireGuard-trusted mode).")

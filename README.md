@@ -323,7 +323,9 @@ Copy `.env.example` to `.env` and fill in your values.
 
 | Variable | Default | Description |
 |---|---|---|
-| `API_KEY` | _(unset)_ | Static Bearer token for the production server. Unset = no auth (trusted network). See [External Provider Auth](#external-provider-auth). |
+| `API_KEY` | _(unset)_ | Static Bearer token for the production server. Also used as OAuth client secret in the minimal connector bridge. |
+| `OAUTH_ALLOWED_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback` | Optional comma-separated allowlist for OAuth bridge redirect URIs. |
+| `OAUTH_ISSUER` | _(auto from request URL)_ | Optional explicit issuer URL when behind reverse proxies/CDNs. |
 
 ### Optional — Server
 
@@ -361,14 +363,9 @@ Copy `.env.example` to `.env` and fill in your values.
 
 ## External Provider Auth
 
-By default the production server runs without authentication — suitable when access is restricted to a trusted network (WireGuard, Tailscale, etc.).
+This server uses static Bearer token auth (`API_KEY`) as the primary security model.
 
-To allow external AI providers (ChatGPT Actions, any public-internet client) to connect securely, set `API_KEY` in your `.env`:
-
-```bash
-# Generate a secure random token
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
+Set an API key:
 
 ```env
 API_KEY=your-generated-token
@@ -379,15 +376,30 @@ Provider-side secret mapping:
 - Secret key id: `api-key`
 - Secret value: your server `API_KEY` value
 
-Every request to the production server will then require `Authorization: Bearer <token>`. The admin server (`:8767`) is never exposed publicly and has no auth requirement.
+Every request to the production server then requires `Authorization: Bearer <token>`.
 
-**Provider auth header template:**
+Header template for clients that support secret interpolation:
 
 ```text
 Authorization: Bearer {{secrets.api-key}}
 ```
 
-`api-key` is only the provider secret id. Runtime server auth remains standard Bearer token validation against `API_KEY`.
+### Minimal OAuth Bridge for Claude Connect
+
+For Claude connector compatibility, the server also exposes minimal OAuth routes:
+
+- `GET /authorize`
+- `POST /token`
+- `/.well-known/oauth-authorization-server`
+- `/.well-known/oauth-protected-resource`
+
+Bridge behavior is intentionally minimal:
+
+1. OAuth `client_id` is fixed to `api-key`.
+2. OAuth `client_secret` must equal `API_KEY`.
+3. Successful token exchange returns bearer token `API_KEY`.
+
+This keeps API-key auth as the only credential while satisfying connector OAuth route expectations.
 
 **MCP client config (external, with auth):**
 
@@ -418,7 +430,7 @@ Authorization: Bearer {{secrets.api-key}}
 }
 ```
 
-The same server handles both — `API_KEY` is the only switch.
+The same server handles both direct Bearer usage and connector OAuth handshake mapped to `API_KEY`.
 
 ---
 

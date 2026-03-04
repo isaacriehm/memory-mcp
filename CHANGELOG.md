@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Minimal OAuth bridge routes for connector compatibility on production server: `/authorize`, `/token`, `/.well-known/oauth-authorization-server`, and protected-resource metadata endpoints.
+- New `oauth.py` module implementing auth code + PKCE validation and token exchange mapped to existing `API_KEY`.
+- Optional OAuth bridge configuration knobs: `OAUTH_ALLOWED_REDIRECT_URIS` and `OAUTH_ISSUER`.
+
+### Changed
+- Production Bearer auth middleware now exempts OAuth bridge/discovery routes while continuing to enforce static `API_KEY` for MCP traffic.
+- Documentation and `.env.example` now describe API-key-first auth with minimal OAuth bridge semantics (`client_id=api-key`, `client_secret=API_KEY`).
+
 ## [1.6.0] - 2026-03-03
 
 ### Added
