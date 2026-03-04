@@ -374,7 +374,20 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 API_KEY=your-generated-token
 ```
 
+Provider-side secret mapping:
+
+- Secret key id: `api-key`
+- Secret value: your server `API_KEY` value
+
 Every request to the production server will then require `Authorization: Bearer <token>`. The admin server (`:8767`) is never exposed publicly and has no auth requirement.
+
+**Provider auth header template:**
+
+```text
+Authorization: Bearer {{secrets.api-key}}
+```
+
+`api-key` is only the provider secret id. Runtime server auth remains standard Bearer token validation against `API_KEY`.
 
 **MCP client config (external, with auth):**
 
