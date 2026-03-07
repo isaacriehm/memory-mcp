@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.2] - 2026-03-07
+
+### Changed
+
+- **Conflict evaluation output contract**: `evaluate_conflict` now requires all six fields from the LLM — `resolution`, `updated_text`, `reason_summary`, `changed_claims`, `confidence_score` (float 0.0–1.0), and `evidence_used` (sentence citing driving claims). Previously `reason_summary` and `changed_claims` were optional; `confidence_score` and `evidence_used` did not exist. The JSON schema and `ConflictResolutionResult` TypedDict are updated to match. `reasoning_effort=minimal` is unchanged.
+- **Taxonomy extraction schema contract**: `category_path` in `SEMANTIC_SECTIONS_SCHEMA` now carries a regex pattern constraint (`^(profile|projects|organizations|concepts|reference)(\.[a-z][a-z0-9_]{0,}){1,4}$`) enforced by OpenAI structured outputs. This prevents the model from emitting invalid root domains or malformed paths at the API level.
+- **Completeness verification in extraction prompt**: `extract_semantic_sections` system prompt now ends with an explicit completeness check instruction — the model must scan the full document and confirm every distinct semantic region has a corresponding section before returning.
+
+### Added
+
+- **`_validate_section_paths()` sanity pass**: New pre-validation function that runs on all extracted sections before `_validate_project_classification()`. Enforces valid L1 root domain (one of five allowed), path depth 2–5 levels, and auto-normalizes the common LLM mistake of `user.X` → `profile.X`. Prevents misclassified paths from reaching the dedup/conflict engine.
+
 ## [1.9.1] - 2026-03-07
 
 ### Fixed

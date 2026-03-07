@@ -22,6 +22,8 @@ class ConflictResolutionResult(TypedDict, total=False):
     updated_text: str
     reason_summary: str
     changed_claims: list[str]
+    confidence_score: float
+    evidence_used: str
 
 
 class SemanticDiffResult(TypedDict):
@@ -55,7 +57,10 @@ SEMANTIC_SECTIONS_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "category_path": {"type": "string"},
+                    "category_path": {
+                        "type": "string",
+                        "pattern": "^(profile|projects|organizations|concepts|reference)(\\.[a-z][a-z0-9_]{0,}){1,4}$",
+                    },
                     "content": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "volatility_class": {
@@ -244,6 +249,44 @@ def _rewrite_project_root(category_path: str, new_root: str) -> str:
     return sanitize_ltree_path(rewritten)
 
 
+_VALID_L1_ROOTS = frozenset(["profile", "projects", "organizations", "concepts", "reference"])
+
+
+def _validate_section_paths(sections: list[dict[str, Any]]) -> None:
+    """
+    Lightweight sanity pass: enforces L1 root domain and path depth on all extracted sections
+    before they reach the dedup/conflict engine. Prevents taxonomy leaks like misclassified
+    cross-project paths or invalid root domains (e.g. 'user' instead of 'profile').
+    """
+    for section in sections:
+        path = section.get("category_path", "reference.unknown")
+        parts = [p for p in path.split(".") if p]
+        if not parts:
+            section["category_path"] = "reference.unknown"
+            logger.warning("Empty category_path replaced with reference.unknown")
+            continue
+        l1 = parts[0]
+        if l1 not in _VALID_L1_ROOTS:
+            if l1 == "user":
+                # Common LLM mistake: 'user.X' should be 'profile.X'
+                tail = ".".join(parts[1:]) if len(parts) > 1 else "identity"
+                section["category_path"] = sanitize_ltree_path(f"profile.{tail}")
+                logger.warning("Normalized invalid L1 root 'user' -> 'profile' for path '%s'", path)
+            else:
+                section["category_path"] = "reference.unknown"
+                logger.warning(
+                    "Invalid L1 root '%s' in path '%s'; replaced with reference.unknown", l1, path
+                )
+            continue
+        # Enforce depth: must be 2–5 levels (l1.l2[.l3.l4.l5])
+        if len(parts) < 2:
+            section["category_path"] = sanitize_ltree_path(f"{l1}.general")
+            logger.warning("Path '%s' is too shallow; expanded to '%s.general'", path, l1)
+        elif len(parts) > 5:
+            section["category_path"] = sanitize_ltree_path(".".join(parts[:5]))
+            logger.warning("Path '%s' exceeds max depth 5; truncated", path)
+
+
 def _validate_project_classification(
     sections: list[dict[str, Any]],
     known_project_roots: list[str] | None,
@@ -374,7 +417,11 @@ async def extract_semantic_sections(
         "and choose a category ending in `.decisions` (typically `projects.<project>.decisions`). Never classify these as historical.\n\n"
         "CHUNKING RULES: Each section MUST be at least 3 sentences or 150 words. Do NOT split a single coherent topic into micro-chunks. Prefer fewer, larger sections over many small ones. A single document should rarely exceed 5 sections.\n\n"
         f"{project_namespace_block}\n\n"
-        f"EXISTING PATHS FOR REFERENCE:\n{active_taxonomy}"
+        f"EXISTING PATHS FOR REFERENCE:\n{active_taxonomy}\n\n"
+        "COMPLETENESS VERIFICATION: Before returning, scan the full document from start to finish and confirm every distinct semantic region is represented by a section. "
+        "Do not merge unrelated topics into a single section. "
+        "If you notice a distinct topic that has no corresponding section, add it. "
+        "Your section list must collectively cover the entire document — no region should be silently dropped."
     )
 
     async def _call():
@@ -426,6 +473,7 @@ async def extract_semantic_sections(
                 s["category_path"] = _force_decisions_category(s["category_path"])
                 s["suggested_tier"] = "canonical"
 
+        _validate_section_paths(sections)
         _validate_project_classification(sections, known_project_roots)
         
         sections = [s for s in sections if len(s.get("content", "").strip()) >= MIN_SECTION_LENGTH]
@@ -542,9 +590,13 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
                         "remains fully true and uncontradicted in the context of NEW TEXT. "
                         "A single mutated fact — however minor — forces \"supersedes\". "
                         "When supersedes, updated_text must be the full original paragraph with the fact integrated, not the isolated fragment.\n\n"
-                        "Output JSON with keys 'resolution' and 'updated_text'. "
-                        "Also include optional keys 'reason_summary' (one short sentence) and "
-                        "'changed_claims' (array of short strings) when possible."
+                        "OUTPUT CONTRACT — all six fields are required:\n"
+                        "• resolution: exactly \"supersedes\" or \"merges\" (no other values allowed).\n"
+                        "• updated_text: the merged or superseding text as described above.\n"
+                        "• reason_summary: one sentence stating WHY this resolution was chosen.\n"
+                        "• changed_claims: array of short strings, each naming one specific claim that changed or was added. Empty array if resolution is \"merges\" with no mutations.\n"
+                        "• confidence_score: float 0.0–1.0 representing your certainty in the resolution. Use 1.0 for unambiguous factual contradictions, lower for inferred or ambiguous changes.\n"
+                        "• evidence_used: one sentence explicitly citing which specific claims or phrases from OLD TEXT and NEW TEXT drove your resolution decision."
                     ),
                 },
                 {"role": "user", "content": f"<old_text>{safe_old}</old_text>\n\n<new_text>{safe_new}</new_text>"},
@@ -563,8 +615,10 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
+                            "confidence_score": {"type": "number"},
+                            "evidence_used": {"type": "string"},
                         },
-                        "required": ["resolution", "updated_text"],
+                        "required": ["resolution", "updated_text", "reason_summary", "changed_claims", "confidence_score", "evidence_used"],
                         "additionalProperties": False,
                     },
                     "strict": True,
@@ -584,6 +638,8 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
         updated_text = parsed.get("updated_text", new_text)
         reason_summary = parsed.get("reason_summary")
         changed_claims = parsed.get("changed_claims")
+        confidence_score = parsed.get("confidence_score")
+        evidence_used = parsed.get("evidence_used")
         result: ConflictResolutionResult = {"resolution": resolution, "updated_text": updated_text}
         if isinstance(reason_summary, str) and reason_summary.strip():
             result["reason_summary"] = reason_summary.strip()
@@ -591,7 +647,16 @@ async def evaluate_conflict(old_text: str, new_text: str) -> ConflictResolutionR
             claims = [str(c).strip() for c in changed_claims if str(c).strip()]
             if claims:
                 result["changed_claims"] = claims
-        logger.debug("Conflict resolved as '%s' with text length %d", resolution, len(updated_text))
+        if isinstance(confidence_score, (int, float)):
+            result["confidence_score"] = float(max(0.0, min(1.0, confidence_score)))
+        if isinstance(evidence_used, str) and evidence_used.strip():
+            result["evidence_used"] = evidence_used.strip()
+        logger.debug(
+            "Conflict resolved as '%s' (confidence=%.2f) with text length %d",
+            resolution,
+            result.get("confidence_score", -1.0),
+            len(updated_text),
+        )
         return result
 
     except Exception as e:
