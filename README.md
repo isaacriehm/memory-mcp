@@ -166,7 +166,7 @@ Add to your MCP settings (`.cursor/mcp.json` or equivalent):
 | `initialize_context` | **Call first every session.** Returns the System Primer + verification prompts for aging memories. |
 | `memorize_context` | Ingest raw text. Automatically chunks, embeds, categorizes, and deduplicates. Supports `ttl_days` and optional `metadata` hints (including `tier` override). |
 | `check_ingestion_status` | Poll async ingestion job by `job_id`. Returns `pending`, `processing`, `complete`, or `failed`. |
-| `search_memory` | Hybrid vector + BM25 search with Reciprocal Rank Fusion. Supports optional, bounded feedback rerank behind a kill switch. Filter by `category_path`; optional `task_type` scopes feedback influence. |
+| `search_memory` | Hybrid vector + BM25 search with Reciprocal Rank Fusion. Supports optional, bounded feedback rerank behind a kill switch. Filter by `category_path`; optional `task_type` scopes feedback influence. Excludes `reference.system.primer`, which is only returned by `initialize_context`. |
 | `report_retrieval_outcome` | Record retrieval feedback (`+1` helpful, `-1` not helpful) for a query-memory pair. Superseded IDs auto-resolve to the latest active memory. Optional `category_path`/`task_type` scope feedback influence. |
 | `list_categories` | Return all occupied taxonomy paths with memory counts. |
 | `explore_taxonomy` | Drill into a collapsed `[+N more]` branch from `list_categories`. |

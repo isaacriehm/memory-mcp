@@ -32,6 +32,8 @@ from utils import (
 from llm import embed, semantic_diff
 from db import get_pool
 
+SYSTEM_PRIMER_CATEGORY = "reference.system.primer"
+
 
 def _hash_query(query: str, category_path: str, task_type: Optional[str] = None) -> str:
     normalized = " ".join(query.lower().split())
@@ -289,7 +291,11 @@ async def search_memory(
 
         db_pool = get_pool()
         async with db_pool.acquire() as conn:
-            where_clause = "m.supersedes_id IS NULL AND m.archived_at IS NULL"
+            where_clause = (
+                "m.supersedes_id IS NULL "
+                "AND m.archived_at IS NULL "
+                f"AND m.category_path != '{SYSTEM_PRIMER_CATEGORY}'::ltree"
+            )
             params = [vec_lit, candidate_limit, query]
             safe_path: Optional[str] = None
             if category_path and category_path.strip():
