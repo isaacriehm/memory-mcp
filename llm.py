@@ -142,7 +142,7 @@ def _default_identifiers_for_root(root: str) -> list[str]:
     if not root_norm:
         return []
     slug = root_norm.split(".", 1)[1]
-    parts = [p for p in slug.replace("-", "_").split("_") if p]
+    parts = [p for p in slug.replace("-", "_").split("_") if len(p) >= 4]
     candidates: list[str] = [slug, slug.replace("_", " "), slug.replace("_", "-")]
     candidates.extend(parts)
     seen: set[str] = set()
@@ -295,6 +295,26 @@ def _validate_project_classification(
                     "Project root '%s' is not in known namespaces and no identifier match was found; "
                     "falling back to projects.general",
                     current_root,
+                )
+            continue
+
+        # Known root but content has ZERO identifier match — likely LLM frequency bias.
+        if assigned_score == 0:
+            if detected_root and detected_score > 0:
+                section["category_path"] = _rewrite_project_root(original_path, detected_root)
+                logger.warning(
+                    "Reclassified zero-match known root '%s' -> '%s' for path '%s'",
+                    current_root,
+                    detected_root,
+                    original_path,
+                )
+            else:
+                section["category_path"] = "projects.general"
+                logger.warning(
+                    "Known root '%s' has zero identifier match and no better alternative; "
+                    "falling back to projects.general for path '%s'",
+                    current_root,
+                    original_path,
                 )
             continue
 

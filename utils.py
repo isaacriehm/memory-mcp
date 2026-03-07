@@ -75,7 +75,7 @@ def sanitize_ltree_path(path: str) -> str:
     if sanitized and sanitized[0] == "user":
         logger.warning("sanitize_ltree_path: rewrote 'user' root to 'profile' in path '%s'", path)
         sanitized[0] = "profile"
-    sanitized = sanitized[:6]
+    sanitized = sanitized[:4]
     return '.'.join(sanitized) if sanitized else 'reference.unknown'
 
 def truncate_text(text: str, max_length: int = 12000) -> str:

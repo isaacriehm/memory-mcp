@@ -92,6 +92,43 @@ async def init_db(conn: asyncpg.Connection) -> None:
     await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;")
     await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS verify_after TIMESTAMPTZ;")
     await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS tier TEXT;")
+
+    # Backfill tier from metadata for records that predate the tier column.
+    await conn.execute(
+        """
+        UPDATE memories
+        SET tier = COALESCE(
+            NULLIF(metadata->>'tier', ''),
+            NULLIF(metadata->>'suggested_tier', ''),
+            CASE
+                WHEN category_path::text LIKE 'context_store%%' THEN 'ephemeral'
+                WHEN category_path::text ~ '(decision|architecture|strategy|roadmap|primer|principles)' THEN 'canonical'
+                ELSE 'canonical'
+            END
+        )
+        WHERE tier IS NULL
+          AND supersedes_id IS NULL
+          AND archived_at IS NULL
+        """
+    )
+
+    # Backfill verify_after from volatility_class for records that predate the column.
+    await conn.execute(
+        """
+        UPDATE memories
+        SET verify_after = CASE metadata->>'volatility_class'
+            WHEN 'high'   THEN updated_at + INTERVAL '7 days'
+            WHEN 'medium' THEN updated_at + INTERVAL '30 days'
+            WHEN 'low'    THEN updated_at + INTERVAL '365 days'
+            ELSE NULL
+        END
+        WHERE verify_after IS NULL
+          AND supersedes_id IS NULL
+          AND archived_at IS NULL
+          AND metadata->>'volatility_class' IS NOT NULL
+          AND metadata->>'volatility_class' != 'static'
+        """
+    )
     await conn.execute(
         """
         DO $$
@@ -281,8 +318,6 @@ async def process_and_insert_memory(
     conn: asyncpg.Connection,
     ttl_days: Optional[int] = None,
     metadata: Optional[dict[str, Any]] = None,
-    dup_threshold: float = 0.95,
-    conflict_threshold: float = 0.85,
 ) -> UUID:
     """
     Insert memory sections into the DB in batches of CHUNK_BATCH_SIZE per transaction.
@@ -361,6 +396,10 @@ async def process_and_insert_memory(
             vec = await embed(chunk_content)
 
         vec_lit = _vector_literal(vec)
+        # Broaden search to 2-level prefix (e.g. projects.myapp) to catch
+        # cross-subtree duplicates within the same project/profile area.
+        path_parts = chunk_path.split(".")
+        search_scope = ".".join(path_parts[:2]) if len(path_parts) >= 2 else chunk_path
         async with db_lock:
             similar_mem = await conn.fetchrow(
                 """
@@ -372,7 +411,7 @@ async def process_and_insert_memory(
                 ORDER BY embedding <=> $1::vector
                 LIMIT 1
                 """,
-                vec_lit, chunk_path
+                vec_lit, search_scope
             )
 
         similarity = float(similar_mem["similarity"]) if similar_mem else 0.0
@@ -445,7 +484,42 @@ async def process_and_insert_memory(
                 "verify_after": chunk_verify_after,
             }
 
-    section_data = await asyncio.gather(*(process_section(i, s) for i, s in enumerate(sections)))
+    section_data = list(await asyncio.gather(*(process_section(i, s) for i, s in enumerate(sections))))
+
+    # Intra-batch deduplication: collapse near-duplicate sections from the
+    # same LLM extraction that bypassed DB-level dedup (parallel processing
+    # means no section sees another from the same batch in the DB).
+    seen_vecs: list[tuple[int, list[float]]] = []
+    deduped_section_data = []
+    for idx, item in enumerate(section_data):
+        if item.get("exists"):
+            deduped_section_data.append(item)
+            continue
+        vec = item.get("vec")
+        if vec is None:
+            deduped_section_data.append(item)
+            continue
+        is_intra_dup = False
+        for seen_idx, seen_vec in seen_vecs:
+            dot = sum(a * b for a, b in zip(vec, seen_vec))
+            mag_a = sum(a * a for a in vec) ** 0.5
+            mag_b = sum(b * b for b in seen_vec) ** 0.5
+            sim = dot / (mag_a * mag_b) if mag_a > 0 and mag_b > 0 else 0.0
+            if sim > DUP_THRESHOLD:
+                logger.debug(
+                    "Intra-batch dedup: section %d is duplicate of section %d (sim: %.3f)",
+                    idx, seen_idx, sim,
+                )
+                deduped_section_data.append({
+                    "id": item["id"], "exists": True,
+                    "duplicate_of": section_data[seen_idx]["id"],
+                })
+                is_intra_dup = True
+                break
+        if not is_intra_dup:
+            seen_vecs.append((idx, vec))
+            deduped_section_data.append(item)
+    section_data = deduped_section_data
 
     first_id: Optional[UUID] = None
     prev_id: Optional[UUID] = None

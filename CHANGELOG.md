@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-03-06
+
+### Fixed
+
+- **Cross-project contamination**: Taxonomy validation now challenges known project roots when content has zero identifier match (assigned_score == 0). Previously, the LLM could misclassify unrelated content (e.g., client project scope) into a known root like `projects.memory_mcp` because the validation only reclassified when another root scored *higher* — when both scored 0, the misclassification stood.
+- **Dedup bypass (cross-subtree)**: Similarity search during ingestion now uses the 2-level category prefix (e.g., `projects.myapp`) instead of the exact subtree path. Previously, a duplicate at `projects.myapp.planning` would not be found when ingesting at `projects.myapp.decisions`, allowing near-identical content to coexist across sub-paths.
+- **Dedup bypass (intra-batch)**: Added post-extraction, pre-insertion deduplication across sections within a single ingestion call. Previously, `asyncio.gather` processed all sections in parallel before any were written to the DB, so no section could detect duplicates from the same batch.
+- **Profile supersession failure**: The broader similarity search scope (fix above) also resolves cases where status updates (e.g., Ashwagandha [ACTIVE] → [RESOLVED]) were ingested at a sibling path and failed to find/supersede the prior record.
+- **Taxonomy over-granularity**: Reduced `sanitize_ltree_path` max depth from 6 to 4 segments, enforcing the LLM prompt's "2-4 levels" guidance. Prevents hyper-fragmented micro-paths (e.g., 7-level controller paths) that orphan single memories below the `MAX_TAXONOMY_PATHS` retrieval cutoff.
+- **Schema drift (tier backfill)**: Added idempotent startup migration that backfills the `tier` column from `metadata->>'tier'`, `metadata->>'suggested_tier'`, or path-based inference for records that predate the column.
+- **Schema drift (verify_after backfill)**: Added idempotent startup migration that computes `verify_after` from `metadata->>'volatility_class'` for records that predate the column, so the verification daemon can pick them up.
+- **Short identifier false positives**: `_default_identifiers_for_root` now filters slug parts to `len >= 4`, matching the threshold already used by `_has_strong_new_root_signal`. Prevents generic 2-3 char tokens (e.g., "mcp", "api", "db") from inflating identifier scores against unrelated content.
+
+### Removed
+
+- Unused `dup_threshold` and `conflict_threshold` parameters from `process_and_insert_memory`. These were dead code — the function body used config-level `DUP_THRESHOLD` and `CONFLICT_THRESHOLD` instead. The `conflict_threshold` default (`0.85`) was also misleading vs the actual config value (`0.55`).
+
 ## [1.8.0] - 2026-03-04
 
 ### Changed
